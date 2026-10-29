@@ -7,13 +7,16 @@
 """
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import json
 import os
 import pty
-import select
 import signal
 import struct
 import subprocess
 import termios
+import threading
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
@@ -229,6 +232,19 @@ def delete_file(
 
 # ── Web 终端（WebSocket + pty）────────────────────────────────
 
+# pty 输出队列水位（块数）：达到高水位暂停读取，形成背压
+_PTY_QUEUE_HIGH = 32
+_PTY_QUEUE_LOW = 8
+
+
+def _reap_child(pid: int) -> None:
+    """阻塞回收 pty 子进程，避免留下僵尸（在后台线程中调用）。"""
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
+
+
 @router.websocket("/terminal")
 async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
     """Linux 终端。认证通过 query 参数 token（WebSocket 不方便带 header）。
@@ -286,14 +302,15 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
 
     # 父进程：设置终端大小（默认 80x24）
     try:
-        import fcntl
         winsz = struct.pack("HHHH", 24, 120, 0, 0)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
     except Exception:
         pass
 
-    import asyncio
-    loop = asyncio.get_event_loop()
+    # 主端设为非阻塞：读写都走事件循环回调，避免大段输入/输出阻塞整个服务
+    os.set_blocking(fd, False)
+
+    loop = asyncio.get_running_loop()
     closed = False
 
     def _cleanup():
@@ -301,6 +318,11 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
         if closed:
             return
         closed = True
+        for remove in (loop.remove_reader, loop.remove_writer):
+            try:
+                remove(fd)
+            except Exception:
+                pass
         try:
             os.close(fd)
         except OSError:
@@ -310,22 +332,86 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
         except (ProcessLookupError, OSError):
             pass
 
-    async def pty_to_ws():
-        """pty 输出 → websocket"""
+    async def _wait_writable():
+        """等待 pty 主端可写；cleanup 关闭 fd 后靠超时退出。"""
+        fut = loop.create_future()
+
+        def _on_writable():
+            if not fut.done():
+                fut.set_result(None)
+
+        loop.add_writer(fd, _on_writable)
         try:
-            while not closed:
-                r, _, _ = await loop.run_in_executor(None, select.select, [fd], [], [], 0.1)
-                if fd in r:
-                    try:
-                        data = os.read(fd, 65536)
-                    except OSError:
-                        break
-                    if not data:
-                        break
-                    await websocket.send_bytes(data)
-        except Exception:
+            await asyncio.wait_for(fut, timeout=0.1)
+        except asyncio.TimeoutError:
             pass
         finally:
+            try:
+                loop.remove_writer(fd)
+            except Exception:
+                pass
+
+    async def _write_all(payload: bytes):
+        """把数据完整写入 pty；缓冲满时异步等待，绝不阻塞事件循环。"""
+        view = memoryview(payload)
+        while view and not closed:
+            try:
+                n = os.write(fd, view)
+            except BlockingIOError:
+                await _wait_writable()
+                continue
+            if n <= 0:
+                # 极端情况下 tty 可能返回 0（如流控），等待后重试，避免丢数据
+                await asyncio.sleep(0.01)
+                continue
+            view = view[n:]
+
+    async def pty_to_ws():
+        """pty 输出 → websocket（高水位暂停读取，避免无界缓冲）"""
+        queue: asyncio.Queue = asyncio.Queue()
+        paused = False
+
+        def _on_readable():
+            nonlocal paused
+            if closed:
+                return
+            if queue.qsize() >= _PTY_QUEUE_HIGH:
+                paused = True
+                try:
+                    loop.remove_reader(fd)
+                except Exception:
+                    pass
+                return
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+            if not data:
+                try:
+                    loop.remove_reader(fd)
+                except Exception:
+                    pass
+                queue.put_nowait(None)
+                return
+            queue.put_nowait(data)
+
+        loop.add_reader(fd, _on_readable)
+        try:
+            while not closed:
+                data = await queue.get()
+                if data is None:
+                    break
+                await websocket.send_bytes(data)
+                if paused and queue.qsize() <= _PTY_QUEUE_LOW and not closed:
+                    paused = False
+                    loop.add_reader(fd, _on_readable)
+        finally:
+            try:
+                loop.remove_reader(fd)
+            except Exception:
+                pass
             _cleanup()
 
     async def ws_to_pty():
@@ -337,23 +423,25 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
                     break
                 data = msg.get("bytes")
                 if data:
-                    os.write(fd, data)
-                else:
-                    text = msg.get("text")
-                    if text:
-                        # 控制消息：{"type":"resize","rows":R,"cols":C}
-                        import json as _json
-                        try:
-                            ctrl = _json.loads(text)
-                            if ctrl.get("type") == "resize":
-                                import fcntl
-                                winsz = struct.pack(
-                                    "HHHH", int(ctrl["rows"]), int(ctrl["cols"]), 0, 0)
-                                fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
-                                continue
-                        except (ValueError, KeyError):
-                            pass
-                        os.write(fd, text.encode())
+                    await _write_all(data)
+                    continue
+                text = msg.get("text")
+                if not text:
+                    continue
+                # 控制消息：{"type":"resize","rows":R,"cols":C}
+                try:
+                    ctrl = json.loads(text)
+                except ValueError:
+                    ctrl = None
+                if isinstance(ctrl, dict) and ctrl.get("type") == "resize":
+                    try:
+                        winsz = struct.pack(
+                            "HHHH", int(ctrl["rows"]), int(ctrl["cols"]), 0, 0)
+                        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
+                    except (KeyError, ValueError, TypeError, OSError):
+                        pass
+                    continue
+                await _write_all(text.encode())
         except WebSocketDisconnect:
             pass
         except Exception:
@@ -361,11 +449,16 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
         finally:
             _cleanup()
 
+    reader = asyncio.create_task(pty_to_ws())
+    writer = asyncio.create_task(ws_to_pty())
     try:
-        await asyncio.gather(pty_to_ws(), ws_to_pty())
+        # 任一端结束（shell 退出 / websocket 断开）即结束会话
+        await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        for task in (reader, writer):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(reader, writer, return_exceptions=True)
         _cleanup()
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except (ChildProcessError, OSError):
-            pass
+        # 子进程可能尚未退出；后台线程阻塞回收，避免僵尸
+        threading.Thread(target=_reap_child, args=(pid,), daemon=True).start()

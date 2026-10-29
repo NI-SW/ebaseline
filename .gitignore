@@ -4,5 +4,10 @@ venv/
 .zcode/
 .env
 *.log
-# 组级工作空间为运行期生成内容，不入库（目录保留在本地）
-workspaces/
+
+# 组级工作空间：脚本/配置入库，但运行时生成的 venv 和缓存排除
+workspaces/*/.venv/
+workspaces/*/__pycache__/
+workspaces/*/output/
+workspaces/*/tmp/
+workspaces/*/*.log
