@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+venv/
+.zcode/
+.env
+*.log
+workspaces/group_*/.venv/

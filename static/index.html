@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ebaseline - 智能体基线测试系统</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f0f2f5; color: #333; }
+a { color: #1890ff; text-decoration: none; }
+button { cursor: pointer; }
+
+/* ── 布局 ── */
+.layout { display: flex; min-height: 100vh; }
+.sidebar { width: 220px; background: #001529; color: #fff; padding: 0; flex-shrink: 0; }
+.sidebar .logo { padding: 20px; font-size: 18px; font-weight: 600; border-bottom: 1px solid #ffffff22; }
+.sidebar .logo small { display: block; font-size: 12px; font-weight: 400; color: #ffffff88; margin-top: 4px; }
+.sidebar nav a { display: block; padding: 12px 20px; color: #ffffffb3; font-size: 14px; }
+.sidebar nav a:hover, .sidebar nav a.active { background: #1890ff; color: #fff; }
+.main { flex: 1; padding: 24px; overflow-x: auto; }
+.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+.topbar h1 { font-size: 20px; }
+.topbar .user { font-size: 14px; color: #666; }
+.topbar .user button { margin-left: 12px; }
+
+/* ── 卡片/表格 ── */
+.card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 2px #0001; margin-bottom: 16px; }
+.card h2 { font-size: 16px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f0f0f0; }
+th { background: #fafafa; font-weight: 600; white-space: nowrap; }
+tr:hover td { background: #fafcff; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+.tag-blue { background: #e6f7ff; color: #1890ff; }
+.tag-green { background: #f6ffed; color: #52c41a; }
+.tag-red { background: #fff2f0; color: #ff4d4f; }
+.tag-orange { background: #fff7e6; color: #fa8c16; }
+.tag-gray { background: #f5f5f5; color: #999; }
+
+/* ── 按钮/表单 ── */
+.btn { border: none; border-radius: 4px; padding: 6px 14px; font-size: 13px; background: #1890ff; color: #fff; }
+.btn:hover { background: #40a9ff; }
+.btn-sm { padding: 3px 10px; font-size: 12px; }
+.btn-default { background: #fff; color: #333; border: 1px solid #d9d9d9; }
+.btn-danger { background: #ff4d4f; }
+.btn-success { background: #52c41a; }
+input, select, textarea { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; font-family: inherit; }
+input:focus, textarea:focus { border-color: #1890ff; outline: none; }
+.form-item { margin-bottom: 16px; }
+.form-item label { display: block; margin-bottom: 6px; font-size: 14px; color: #555; }
+
+/* ── 登录页 ── */
+.login-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #001529 0%, #003a8c 100%); }
+.login-box { background: #fff; border-radius: 12px; padding: 40px; width: 380px; box-shadow: 0 8px 30px #0003; }
+.login-box h1 { font-size: 24px; text-align: center; margin-bottom: 8px; }
+.login-box .sub { text-align: center; color: #999; font-size: 13px; margin-bottom: 30px; }
+.login-box .btn { width: 100%; padding: 10px; font-size: 15px; }
+
+/* ── 弹窗 ── */
+.modal-mask { position: fixed; inset: 0; background: #00000066; display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal { background: #fff; border-radius: 8px; padding: 24px; width: 560px; max-height: 85vh; overflow-y: auto; }
+.modal h3 { margin-bottom: 20px; }
+.modal .footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
+/* ── 消息 ── */
+.toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 6px; color: #fff; z-index: 999; font-size: 14px; box-shadow: 0 4px 12px #0002; }
+.toast.success { background: #52c41a; }
+.toast.error { background: #ff4d4f; }
+
+/* ── 日志 ── */
+.log-view { background: #001529; color: #a6ffb8; padding: 16px; border-radius: 6px; font-family: "SF Mono", Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 500px; overflow-y: auto; }
+.detail-grid { display: grid; grid-template-columns: 100px 1fr; gap: 8px 16px; font-size: 14px; }
+.detail-grid dt { color: #999; }
+.detail-grid dd { word-break: break-all; }
+.mono { font-family: Consolas, monospace; font-size: 13px; }
+/* ── 全屏日志查看器 ── */
+.fullscreen-log { position: fixed; inset: 0; background: #0d1117; z-index: 200; display: flex; flex-direction: column; }
+.fullscreen-log .log-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+.fullscreen-log .log-header h3 { color: #e6edf3; font-size: 15px; }
+.fullscreen-log .log-header .meta { color: #8b949e; font-size: 13px; margin-left: 16px; }
+.fullscreen-log .log-header .actions { display: flex; gap: 8px; }
+.fullscreen-log .log-body { flex: 1; overflow-y: auto; padding: 20px; }
+.fullscreen-log .log-content { color: #a6ffb8; font-family: "SF Mono", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; margin: 0; }
+.fullscreen-log .log-status { padding: 8px 20px; background: #161b22; border-top: 1px solid #30363d; font-size: 12px; color: #8b949e; display: flex; justify-content: space-between; flex-shrink: 0; }
+.fullscreen-log .log-status .live { color: #3fb950; }
+.fullscreen-log .log-status .live::before { content: '●'; margin-right: 6px; animation: blink 1.5s infinite; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.btn-log { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+.btn-log:hover { background: #30363d; }
+
+/* ── 工作空间（VS Code 风格）── */
+.ws-layout { display: flex; height: 100vh; background: #1e1e1e; overflow: hidden; }
+.ws-sidebar { width: 240px; background: #252526; color: #ccc; display: flex; flex-direction: column; flex-shrink: 0; border-right: 1px solid #1a1a1a; }
+.ws-sidebar .ws-side-header { padding: 10px 12px; font-size: 12px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; }
+.ws-sidebar .ws-side-header .ops button { background: none; border: none; color: #999; font-size: 14px; padding: 2px 6px; border-radius: 3px; }
+.ws-sidebar .ws-side-header .ops button:hover { background: #3c3c3c; color: #fff; }
+.ws-tree { flex: 1; overflow-y: auto; font-size: 13px; padding: 4px 0; }
+.ws-tree .tree-item { padding: 4px 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ws-tree .tree-item:hover { background: #2a2d2e; }
+.ws-tree .tree-item.active { background: #37373d; color: #fff; }
+.ws-tree .tree-item .icon { width: 16px; text-align: center; }
+.ws-tree .tree-item.dir { color: #dcb67a; }
+.ws-tree .tree-item .size { margin-left: auto; color: #666; font-size: 11px; }
+.ws-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.ws-editor-head { background: #252526; padding: 8px 16px; font-size: 13px; color: #ccc; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1a1a1a; flex-shrink: 0; }
+.ws-editor-head .path { font-family: Consolas, monospace; }
+.ws-editor-head .dirty { color: #e5c07b; margin-left: 8px; }
+.ws-editor { flex: 1; min-height: 0; overflow: hidden; }
+.ws-editor textarea { width: 100%; height: 100%; background: #1e1e1e; color: #d4d4d4; border: none; outline: none; resize: none; padding: 16px; font-family: "SF Mono", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.6; tab-size: 4; }
+.ws-welcome { flex: 1; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; color: #555; font-size: 14px; flex-direction: column; gap: 12px; }
+.ws-terminal-wrap { height: 280px; max-height: 50vh; background: #0c0c0c; border-top: 1px solid #30363d; display: flex; flex-direction: column; flex-shrink: 0; }
+.ws-terminal-wrap.collapsed { height: 32px; max-height: 32px; }
+.ws-terminal-wrap.collapsed #ws-terminal { display: none; }
+.ws-term-header { padding: 6px 12px; font-size: 12px; color: #999; background: #161b22; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+.ws-term-header .ops button { background: none; border: none; color: #999; cursor: pointer; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+.ws-term-header .ops button:hover { background: #30363d; color: #fff; }
+#ws-terminal { flex: 1; min-height: 0; overflow: hidden; padding: 4px 8px; }
+#ws-terminal .xterm { height: 100%; }
+.ws-statusbar { height: 24px; background: #007acc; color: #fff; font-size: 12px; display: flex; align-items: center; padding: 0 12px; gap: 16px; flex-shrink: 0; }
+.ws-statusbar .right { margin-left: auto; }
+</style>
+<!-- xterm.js -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+/* ═══════════════════════ 工具 ═══════════════════════ */
+const $ = sel => document.querySelector(sel);
+const state = { token: localStorage.getItem('eb_token'), user: null, page: 'groups', detail: null };
+
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2500);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(state.token ? { 'Authorization': `Bearer ${state.token}` } : {}),
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401) { logout(); throw new Error('未登录'); }
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+function logout() {
+  localStorage.removeItem('eb_token');
+  state.token = null; state.user = null;
+  render();
+}
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+const BATCH_STATUS = { 0: ['未执行','tag-gray'], 1: ['执行中','tag-blue'], 2: ['已完成','tag-green'], 3: ['执行失败','tag-red'], 4: ['部分成功','tag-orange'] };
+const RESULT_TEXT = { 0: ['未执行','tag-gray'], 1: ['成功','tag-green'], 2: ['失败','tag-red'], 3: ['执行中','tag-blue'] };
+// 任务细分结果（从 process 中解析 result_detail）
+const RESULT_DETAIL = { 2: ['成功','tag-green'], 1: ['校验通过(Agent异常)','tag-orange'], 0: ['失败','tag-red'] };
+
+function parseResultDetail(process) {
+  if (!process) return null;
+  const m = process.match(/=== 任务 \d+ (成功|校验通过\(Agent异常\)|失败) ===/);
+  if (!m) return null;
+  const map = { '成功': 2, '校验通过(Agent异常)': 1, '失败': 0 };
+  return map[m[1]] ?? null;
+}
+
+function getResultTag(result, process) {
+  // 执行中状态直接显示
+  if (result === 3) return RESULT_TEXT[3];
+  const detail = parseResultDetail(process);
+  if (detail !== null) return RESULT_DETAIL[detail];
+  return RESULT_TEXT[result] || ['未知', 'tag-gray'];
+}
+
+/* ═══════════════════════ 登录页 ═══════════════════════ */
+function renderLogin() {
+  $('#app').innerHTML = `
+  <div class="login-page"><div class="login-box">
+    <h1>ebaseline</h1>
+    <div class="sub">智能体基线测试系统</div>
+    <div class="form-item"><label>用户名</label><input id="l_user" value="admin"></div>
+    <div class="form-item"><label>密码</label><input id="l_pass" type="password" value=""></div>
+    <button class="btn" onclick="doLogin()">登 录</button>
+  </div></div>`;
+  $('#l_pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+}
+
+async function doLogin() {
+  try {
+    const r = await api('/api/v1/auth/login', { method: 'POST',
+      body: JSON.stringify({ username: $('#l_user').value, password: $('#l_pass').value }) });
+    state.token = r.access_token;
+    localStorage.setItem('eb_token', r.access_token);
+    state.user = await api('/api/v1/auth/me');
+    state.page = 'groups';
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ═══════════════════════ 主框架 ═══════════════════════ */
+const PAGES = [
+  ['groups', '任务组'],
+  ['subjects', '待测主体'],
+  ['batches', '测试批次'],
+  ['results', '执行结果'],
+];
+
+function render() {
+  if (!state.token) return renderLogin();
+  document.body.style.overflow = '';
+  if (state.page === 'workspace') return renderWorkspaceFull();
+  $('#app').innerHTML = `
+  <div class="layout">
+    <div class="sidebar">
+      <div class="logo">ebaseline<small>智能体基线测试系统</small></div>
+      <nav>${PAGES.map(([k, n]) => `<a class="${state.page === k ? 'active' : ''}" onclick="goto('${k}')">${n}</a>`).join('')}</nav>
+    </div>
+    <div class="main">
+      <div class="topbar">
+        <h1 id="page-title"></h1>
+        <div class="user">${esc(state.user?.username)}（${['普通用户','管理员','超管'][state.user?.privilege] ?? ''}）<button class="btn btn-default btn-sm" onclick="logout()">退出</button></div>
+      </div>
+      <div id="content"></div>
+    </div>
+  </div>`;
+  loadPage();
+}
+
+function goto(p) { state.page = p; state.detail = null; if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; } if (_wsSocket) { _wsSocket.close(); _wsSocket = null; } render(); }
+
+async function loadPage() {
+  const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults }[state.page];
+  if (fn) await fn();
+}
+
+/* ═══════════════════════ 任务组 ═══════════════════════ */
+async function pageGroups() {
+  $('#page-title').textContent = '任务组';
+  const groups = await api('/api/v1/groups');
+  const canEdit = state.user.privilege >= 1;
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between"><h2>任务组列表</h2>${canEdit ? '<button class="btn" onclick="showGroupModal()">+ 新建任务组</button>' : ''}</div>
+    <table><thead><tr><th>ID</th><th>名称</th><th>描述</th><th>Python</th><th>变量数</th><th>操作</th></tr></thead>
+    <tbody>${groups.map(g => `<tr>
+      <td>${g.id}</td><td><a onclick="pageTasks(${g.id}, '${esc(g.name)}')">${esc(g.name)}</a></td>
+      <td>${esc(g.description || '')}</td>
+      <td><span class="tag tag-blue">${g.python_version || '3.11'}</span></td>
+      <td>${g.variables ? Object.keys(g.variables).length : 0}</td>
+      <td>
+        <button class="btn btn-sm btn-default" onclick="pageTasks(${g.id}, '${esc(g.name)}')">任务</button>
+        <button class="btn btn-sm" onclick="openWorkspace(${g.id}, '${esc(g.name)}')">工作空间</button>
+        ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showGroupModal(${JSON.stringify(g)})'>编辑</button>
+        <button class="btn btn-sm btn-danger" onclick="delGroup(${g.id})">删除</button>` : ''}
+      </td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无任务组</td></tr>'}
+    </tbody></table>
+  </div>`;
+}
+
+function showGroupModal(g) {
+  const isEdit = !!g;
+  showModal(`${isEdit ? '编辑' : '新建'}任务组`, `
+    <div class="form-item"><label>名称</label><input id="g_name" value="${esc(g?.name || '')}"></div>
+    <div class="form-item"><label>描述</label><input id="g_desc" value="${esc(g?.description || '')}"></div>
+    <div class="form-item"><label>Python 版本（工作空间独立 venv）</label>
+      <select id="g_pyver">
+        <option value="3.9" ${g?.python_version === '3.9' ? 'selected' : ''}>Python 3.9 (系统)</option>
+        <option value="3.11" ${(g?.python_version || '3.11') === '3.11' ? 'selected' : ''}>Python 3.11 (推荐)</option>
+        <option value="3.14" ${g?.python_version === '3.14' ? 'selected' : ''}>Python 3.14 (最新)</option>
+      </select>
+    </div>
+    <div class="form-item"><label>变量（JSON）</label><textarea id="g_vars" rows="8">${esc(g?.variables ? JSON.stringify(g.variables, null, 2) : '{}')}</textarea></div>
+  `, async () => {
+    let vars = null;
+    const raw = $('#g_vars').value.trim();
+    if (raw && raw !== '{}') { try { vars = JSON.parse(raw); } catch { toast('变量 JSON 格式错误', 'error'); return false; } }
+    const body = { name: $('#g_name').value, description: $('#g_desc').value, variables: vars, python_version: $('#g_pyver').value };
+    if (isEdit) await api(`/api/v1/groups/${g.id}`, { method: 'PUT', body: JSON.stringify(body) });
+    else await api('/api/v1/groups', { method: 'POST', body: JSON.stringify(body) });
+    toast('保存成功'); pageGroups();
+  });
+}
+
+async function delGroup(gid) {
+  if (!confirm('删除任务组将级联删除组内任务，确认？')) return;
+  await api(`/api/v1/groups/${gid}`, { method: 'DELETE' });
+  toast('已删除'); pageGroups();
+}
+
+/* ═══════════════════════ 任务列表 ═══════════════════════ */
+async function pageTasks(gid, gname) {
+  state.page = 'tasks';
+  $('#page-title').textContent = `任务组：${gname}`;
+  const [tasks, group] = await Promise.all([api(`/api/v1/groups/${gid}/tasks`), api(`/api/v1/groups/${gid}`)]);
+  const canEdit = state.user.privilege >= 1;
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between">
+      <h2>任务列表（组 ${gid}）</h2>
+      <div class="flex">
+        <button class="btn btn-default" onclick="goto('groups')">返回</button>
+        ${canEdit ? `<button class="btn" onclick="showTaskModal(${gid})">+ 新建任务</button>` : ''}
+      </div>
+    </div>
+    <table><thead><tr><th>TID</th><th>名称</th><th>依赖</th><th>前置脚本</th><th>校验脚本</th><th>清理脚本</th><th>操作</th></tr></thead>
+    <tbody>${tasks.map(t => `<tr>
+      <td class="mono">${t.tid}</td><td>${esc(t.name)}</td>
+      <td class="mono">${(t.depends || []).join(', ') || '-'}</td>
+      <td class="mono">${esc(t.pre_script || '-')}</td>
+      <td class="mono">${esc(t.expect || '-')}</td>
+      <td class="mono">${esc(t.clean || '-')}</td>
+      <td>
+        <button class="btn btn-sm btn-default" onclick='viewTask(${JSON.stringify(t)})'>详情</button>
+        ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showTaskModal(${gid}, ${JSON.stringify(t)})'>编辑</button>
+        <button class="btn btn-sm btn-danger" onclick="delTask(${t.tid}, ${gid}, '${esc(gname)}')">删除</button>` : ''}
+      </td></tr>`).join('') || '<tr><td colspan="7" class="empty">暂无任务</td></tr>'}
+    </tbody></table>
+  </div>
+  <div class="card"><h2>组变量</h2><div class="log-view">${esc(JSON.stringify(group.variables, null, 2) || '{}')}</div></div>`;
+}
+
+function viewTask(t) {
+  showModal(`任务详情：${esc(t.name)}`, `
+    <dl class="detail-grid">
+      <dt>TID</dt><dd class="mono">${t.tid}</dd>
+      <dt>描述</dt><dd>${esc(t.description || '-')}</dd>
+      <dt>依赖</dt><dd class="mono">${(t.depends || []).join(', ') || '-'}</dd>
+      <dt>前置脚本</dt><dd class="mono">${esc(t.pre_script || '-')}</dd>
+      <dt>校验脚本</dt><dd class="mono">${esc(t.expect || '-')}</dd>
+      <dt>清理脚本</dt><dd class="mono">${esc(t.clean || '-')}</dd>
+    </dl>
+    <div class="form-item" style="margin-top:16px"><label>输入（input）</label>
+    <div class="log-view">${esc(JSON.stringify(t.input, null, 2) || '{}')}</div></div>
+  `, null);
+}
+
+function showTaskModal(gid, t) {
+  const isEdit = !!t;
+  showModal(`${isEdit ? '编辑' : '新建'}任务`, `
+    ${isEdit ? '' : '<div class="form-item"><label>TID（留空自动分配）</label><input id="t_tid" placeholder="自动"></div>'}
+    <div class="form-item"><label>名称</label><input id="t_name" value="${esc(t?.name || '')}"></div>
+    <div class="form-item"><label>描述</label><input id="t_desc" value="${esc(t?.description || '')}"></div>
+    <div class="form-item"><label>依赖（逗号分隔的 tid）</label><input id="t_deps" value="${(t?.depends || []).join(',')}"></div>
+    <div class="form-item"><label>前置脚本</label><input id="t_pre" value="${esc(t?.pre_script || '')}" placeholder="check_xxx.py --arg"></div>
+    <div class="form-item"><label>输入（JSON：{prompt, conversation?}）</label><textarea id="t_input" rows="6">${esc(t?.input ? JSON.stringify(t.input, null, 2) : '{"prompt": ""}')}</textarea></div>
+    <div class="form-item"><label>校验脚本</label><input id="t_expect" value="${esc(t?.expect || '')}"></div>
+    <div class="form-item"><label>清理脚本</label><input id="t_clean" value="${esc(t?.clean || '')}"></div>
+  `, async () => {
+    let inputObj = null;
+    const rawInput = $('#t_input').value.trim();
+    if (rawInput) { try { inputObj = JSON.parse(rawInput); } catch { toast('input JSON 格式错误', 'error'); return false; } }
+    const depsRaw = $('#t_deps').value.trim();
+    const body = {
+      name: $('#t_name').value, description: $('#t_desc').value,
+      depends: depsRaw ? depsRaw.split(',').map(x => parseInt(x.trim())).filter(x => !isNaN(x)) : null,
+      pre_script: $('#t_pre').value || null, input: inputObj,
+      expect: $('#t_expect').value || null, clean: $('#t_clean').value || null,
+    };
+    if (isEdit) await api(`/api/v1/tasks/${t.tid}`, { method: 'PUT', body: JSON.stringify(body) });
+    else {
+      const tidRaw = $('#t_tid').value.trim();
+      if (tidRaw) body.tid = parseInt(tidRaw);
+      await api(`/api/v1/groups/${gid}/tasks`, { method: 'POST', body: JSON.stringify(body) });
+    }
+    toast('保存成功'); pageTasks(gid, '');
+  });
+}
+
+async function delTask(tid, gid, gname) {
+  if (!confirm('确认删除该任务？')) return;
+  await api(`/api/v1/tasks/${tid}`, { method: 'DELETE' });
+  toast('已删除'); pageTasks(gid, gname);
+}
+
+/* ═══════════════════════ 待测主体 ═══════════════════════ */
+async function pageSubjects() {
+  $('#page-title').textContent = '待测主体';
+  const subjects = await api('/api/v1/subjects');
+  const canEdit = state.user.privilege >= 1;
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between"><h2>待测 Agent 列表</h2>${canEdit ? '<button class="btn" onclick="showSubjectModal()">+ 注册 Agent</button>' : ''}</div>
+    <table><thead><tr><th>ID</th><th>名称</th><th>地址</th><th>端口</th><th>API 模式</th><th>操作</th></tr></thead>
+    <tbody>${subjects.map(s => `<tr>
+      <td>${s.id}</td><td>${esc(s.name || '-')}</td><td class="mono">${esc(s.ipaddr)}</td><td class="mono">${s.port}</td>
+      <td><span class="tag tag-blue">${s.api_mode === 0 ? 'OpenAI Responses' : '模式 ' + s.api_mode}</span></td>
+      <td>${canEdit ? `<button class="btn btn-sm btn-default" onclick='showSubjectModal(${JSON.stringify(s)})'>编辑</button>
+      <button class="btn btn-sm btn-danger" onclick="delSubject(${s.id})">删除</button>` : ''}</td>
+    </tr>`).join('') || '<tr><td colspan="6" class="empty">暂无待测主体</td></tr>'}
+    </tbody></table>
+  </div>`;
+}
+
+function showSubjectModal(s) {
+  const isEdit = !!s;
+  showModal(`${isEdit ? '编辑' : '注册'}待测 Agent`, `
+    <div class="form-item"><label>名称 / 代号</label><input id="s_name" value="${esc(s?.name || '')}" placeholder="如：生产环境 Hermes Agent"></div>
+    <div class="form-item"><label>IP 地址</label><input id="s_ip" value="${esc(s?.ipaddr || '')}" placeholder="192.168.34.65"></div>
+    <div class="form-item"><label>端口</label><input id="s_port" type="number" value="${s?.port || 58642}"></div>
+    <div class="form-item"><label>API Key</label><input id="s_secret" value="" placeholder="${isEdit ? '留空则不修改' : ''}"></div>
+    <div class="form-item"><label>API 模式</label><select id="s_mode"><option value="0" ${s?.api_mode === 0 ? 'selected' : ''}>OpenAI Responses API</option></select></div>
+  `, async () => {
+    const body = { name: $('#s_name').value, ipaddr: $('#s_ip').value, port: parseInt($('#s_port').value), api_mode: parseInt($('#s_mode').value) };
+    const secret = $('#s_secret').value;
+    if (secret || !isEdit) body.secret = secret;
+    if (isEdit) await api(`/api/v1/subjects/${s.id}`, { method: 'PUT', body: JSON.stringify(body) });
+    else await api('/api/v1/subjects', { method: 'POST', body: JSON.stringify(body) });
+    toast('保存成功'); pageSubjects();
+  });
+}
+
+async function delSubject(sid) {
+  if (!confirm('确认删除该待测主体？')) return;
+  await api(`/api/v1/subjects/${sid}`, { method: 'DELETE' });
+  toast('已删除'); pageSubjects();
+}
+
+/* ═══════════════════════ 批次 ═══════════════════════ */
+let _batchDetailTimer = null;
+
+async function pageBatches() {
+  if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
+  $('#page-title').textContent = '测试批次';
+  const [batches, subjects, groups] = await Promise.all([
+    api('/api/v1/batches'), api('/api/v1/subjects'), api('/api/v1/groups')]);
+  const subjMap = Object.fromEntries(subjects.map(s => [s.id, `${s.name || s.ipaddr + ':' + s.port}`]));
+  const groupMap = Object.fromEntries(groups.map(g => [g.id, g.name]));
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between"><h2>批次列表</h2><button class="btn" onclick='showBatchModal(${JSON.stringify(subjects)}, ${JSON.stringify(groups)})'>+ 创建批次</button></div>
+    <table><thead><tr><th>ID</th><th>待测主体</th><th>任务组</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+    <tbody>${batches.map(b => {
+      const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+      return `<tr>
+        <td>${b.id}</td>
+        <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
+        <td>${esc(groupMap[b.gid] || `gid=${b.gid}`)}</td>
+        <td><span class="tag ${cls}">${txt}</span></td>
+        <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
+        <td>
+          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id})">详情</button>
+          ${b.status !== 1 ? `<button class="btn btn-sm btn-success" onclick="runBatch(${b.id})">执行</button>` :
+            `<button class="btn btn-sm btn-danger" onclick="cancelBatch(${b.id})">取消</button>`}
+          ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id})">删除</button>` : ''}
+        </td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="empty">暂无批次</td></tr>'}
+    </tbody></table>
+  </div>`;
+}
+
+function showBatchModal(subjects, groups) {
+  showModal('创建测试批次', `
+    <div class="form-item"><label>待测 Agent</label><select id="b_sid">
+      ${subjects.map(s => `<option value="${s.id}">${esc(s.name || '')}（${esc(s.ipaddr)}:${s.port}）</option>`).join('')}
+    </select></div>
+    <div class="form-item"><label>任务组</label><select id="b_gid">
+      ${groups.map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join('')}
+    </select></div>
+  `, async () => {
+    const r = await api('/api/v1/batches', { method: 'POST',
+      body: JSON.stringify({ sid: parseInt($('#b_sid').value), gid: parseInt($('#b_gid').value) }) });
+    toast(`批次 ${r.id} 已创建`); pageBatches();
+  });
+}
+
+async function runBatch(bid) {
+  await api(`/api/v1/batches/${bid}/run`, { method: 'POST' });
+  toast('批次已启动'); setTimeout(pageBatches, 800);
+}
+
+async function cancelBatch(bid) {
+  await api(`/api/v1/batches/${bid}/cancel`, { method: 'POST' });
+  toast('已发送取消信号'); setTimeout(pageBatches, 800);
+}
+
+async function delBatch(bid) {
+  if (!confirm(`删除批次 #${bid} 将同时删除该批次的所有执行结果，确认？`)) return;
+  await api(`/api/v1/batches/${bid}`, { method: 'DELETE' });
+  toast('批次已删除'); pageBatches();
+}
+
+async function batchDetail(bid) {
+  if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
+  const b = await api(`/api/v1/batches/${bid}`);
+  const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span></h2>
+      <div class="flex"><button class="btn btn-default" onclick="pageBatches()">返回</button>
+      <button class="btn btn-default" onclick="batchDetail(${bid})">刷新</button></div></div>
+    <dl class="detail-grid">
+      <dt>批次 ID</dt><dd>${b.id}</dd>
+      <dt>待测主体</dt><dd class="mono">sid=${b.sid}</dd>
+      <dt>任务组</dt><dd>gid=${b.gid}</dd>
+      <dt>创建时间</dt><dd class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</dd>
+    </dl>
+  </div>
+  <div class="card"><h2>任务执行状态</h2>
+    <table><thead><tr><th>TID</th><th>任务</th><th>结果</th><th>完成时间</th><th>操作</th></tr></thead>
+    <tbody>${(b.tasks || []).map(t => {
+      const [rt, rc] = getResultTag(t.result, t.process);
+      return `<tr><td class="mono">${t.tid}</td><td>${esc(t.name)}</td>
+        <td><span class="tag ${rc}">${rt}</span></td>
+        <td class="mono">${t.create_time ? new Date(t.create_time).toLocaleString('zh-CN') : '-'}</td>
+        <td>${(t.process || t.result === 0 || t.result === 3) ? `<button class="btn btn-sm btn-default" onclick="viewLog(${t.tid}, ${b.sid}, ${b.gid})">${t.result === 3 ? '实时日志' : '查看日志'}</button>` : ''}</td></tr>`;
+    }).join('')}
+    </tbody></table>
+  </div>`;
+  // 批次执行中时每 3 秒自动刷新
+  if (b.status === 1) {
+    _batchDetailTimer = setInterval(() => {
+      if ($('#page-title') && document.querySelector('.fullscreen-log') === null) {
+        batchDetail(bid);
+      }
+    }, 3000);
+  }
+}
+
+/* ═══════════════════════ 全屏日志查看器 ═══════════════════════ */
+let _logViewerTimer = null;
+let _logViewerResultId = null;
+
+/**
+ * 全屏打开日志查看器。
+ * @param {number} resultId - task_result 的 id
+ * @param {string} title - 标题
+ * @param {boolean} live - 是否实时刷新（默认 true，仅当任务可能还在运行时）
+ */
+function openLogViewer(resultId, title, live = true) {
+  closeLogViewer(); // 先关旧的
+  _logViewerResultId = resultId;
+
+  const el = document.createElement('div');
+  el.className = 'fullscreen-log';
+  el.id = 'fullscreen-log-viewer';
+  el.innerHTML = `
+    <div class="log-header">
+      <div><h3>${esc(title)}</h3><span class="meta" id="log-meta">加载中...</span></div>
+      <div class="actions">
+        <button class="btn btn-log btn-sm" onclick="refreshLogViewer()">刷新</button>
+        <button class="btn btn-log btn-sm" onclick="copyLogContent()">复制</button>
+        <button class="btn btn-log btn-sm" onclick="closeLogViewer()">✕ 关闭 (Esc)</button>
+      </div>
+    </div>
+    <div class="log-body"><pre class="log-content" id="log-content">加载中...</pre></div>
+    <div class="log-status">
+      <span id="log-status-text">${live ? '<span class="live">实时刷新中（每 2 秒）</span>' : '已结束'}</span>
+      <span id="log-updated"></span>
+    </div>`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+
+  // Esc 关闭
+  el._escHandler = e => { if (e.key === 'Escape') closeLogViewer(); };
+  document.addEventListener('keydown', el._escHandler);
+
+  refreshLogViewer();
+  if (live) {
+    _logViewerTimer = setInterval(refreshLogViewer, 2000);
+  }
+}
+
+async function refreshLogViewer() {
+  if (!_logViewerResultId) return;
+  try {
+    const r = await api(`/api/v1/results/${_logViewerResultId}`);
+    const logEl = $('#log-content');
+    const metaEl = $('#log-meta');
+    const statusEl = $('#log-status-text');
+    const updatedEl = $('#log-updated');
+    if (!logEl) return; // 已关闭
+
+    const wasAtBottom = logEl.parentElement.scrollHeight - logEl.parentElement.scrollTop <= logEl.parentElement.clientHeight + 50;
+    logEl.textContent = r.process || '（暂无日志）';
+    if (wasAtBottom) logEl.parentElement.scrollTop = logEl.parentElement.scrollHeight;
+
+    const [rt, rc] = getResultTag(r.result, r.process);
+    metaEl.textContent = `sid=${r.sid} gid=${r.gid} tid=${r.tid} | 结果: ${rt} | 时间: ${new Date(r.create_time).toLocaleString('zh-CN')}`;
+    updatedEl.textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
+
+    // 任务已结束（1=成功 2=失败）则停止实时刷新；0=未执行 3=执行中 继续刷新
+    if (r.result !== 0 && r.result !== 3 && _logViewerTimer) {
+      clearInterval(_logViewerTimer);
+      _logViewerTimer = null;
+      if (statusEl) statusEl.innerHTML = '已结束';
+    }
+  } catch (e) {
+    const logEl = $('#log-content');
+    if (logEl) logEl.textContent = `加载失败: ${e.message}`;
+  }
+}
+
+function copyLogContent() {
+  const text = $('#log-content')?.textContent || '';
+  navigator.clipboard.writeText(text).then(() => toast('已复制到剪贴板'));
+}
+
+function closeLogViewer() {
+  if (_logViewerTimer) { clearInterval(_logViewerTimer); _logViewerTimer = null; }
+  _logViewerResultId = null;
+  const el = $('#fullscreen-log-viewer');
+  if (el) {
+    document.removeEventListener('keydown', el._escHandler);
+    el.remove();
+  }
+  document.body.style.overflow = '';
+}
+
+async function viewLog(tid, sid, gid) {
+  const results = await api(`/api/v1/results?sid=${sid}&gid=${gid}&tid=${tid}`);
+  if (!results.length) { toast('暂无日志', 'error'); return; }
+  const r = results[0];
+  // 任务未执行完（result=0 或 3）时开启实时刷新
+  openLogViewer(r.id, `任务 ${tid} 执行日志`, r.result === 0 || r.result === 3);
+}
+
+/* ═══════════════════════ 结果 ═══════════════════════ */
+let _resultSelected = new Set();
+
+async function pageResults() {
+  $('#page-title').textContent = '执行结果';
+  _resultSelected.clear();
+  const results = await api('/api/v1/results');
+  const canEdit = state.user.privilege >= 1;
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between">
+      <h2>结果列表</h2>
+      <div class="flex">
+        ${canEdit ? '<button class="btn btn-danger btn-sm" onclick="delSelectedResults()" id="del-selected-btn" style="display:none">删除选中</button>' : ''}
+        <button class="btn btn-default" onclick="exportCsv()">导出 CSV</button>
+      </div>
+    </div>
+    <table><thead><tr>
+      ${canEdit ? '<th><input type="checkbox" onchange="toggleSelectAll(this)"></th>' : ''}
+      <th>ID</th><th>SID</th><th>GID</th><th>TID</th><th>结果</th><th>时间</th><th>操作</th></tr></thead>
+    <tbody>${results.map(r => {
+      const [rt, rc] = getResultTag(r.result, r.process);
+      return `<tr>
+        ${canEdit ? `<td><input type="checkbox" class="result-cb" data-id="${r.id}" onchange="toggleResultSelect(${r.id}, this.checked)"></td>` : ''}
+        <td>${r.id}</td><td class="mono">${r.sid}</td><td class="mono">${r.gid}</td>
+        <td class="mono">${r.tid}</td><td><span class="tag ${rc}">${rt}</span></td>
+        <td class="mono">${new Date(r.create_time).toLocaleString('zh-CN')}</td>
+        <td>
+          ${(r.process || r.result === 0 || r.result === 3) ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${r.id}, '结果 #${r.id} 日志', ${r.result === 0 || r.result === 3})">${r.result === 3 ? '实时日志' : '日志'}</button>` : ''}
+          ${canEdit ? `<button class="btn btn-sm btn-danger" onclick="delResult(${r.id})">删除</button>` : ''}
+        </td></tr>`;
+    }).join('') || `<tr><td colspan="${canEdit ? 8 : 7}" class="empty">暂无结果</td></tr>`}
+    </tbody></table>
+  </div>`;
+}
+
+async function exportCsv() {
+  const res = await fetch('/api/v1/results/export', {
+    headers: { 'Authorization': `Bearer ${state.token}` },
+  });
+  if (!res.ok) { toast('导出失败', 'error'); return; }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `results_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('CSV 已下载');
+}
+
+function toggleSelectAll(cb) {
+  const checked = cb.checked;
+  document.querySelectorAll('.result-cb').forEach(el => {
+    el.checked = checked;
+    toggleResultSelect(parseInt(el.dataset.id), checked);
+  });
+}
+
+function toggleResultSelect(id, checked) {
+  if (checked) _resultSelected.add(id);
+  else _resultSelected.delete(id);
+  const btn = $('#del-selected-btn');
+  if (btn) btn.style.display = _resultSelected.size > 0 ? '' : 'none';
+}
+
+async function delResult(id) {
+  if (!confirm(`删除结果 #${id}？`)) return;
+  await api(`/api/v1/results/${id}`, { method: 'DELETE' });
+  toast('已删除'); pageResults();
+}
+
+async function delSelectedResults() {
+  if (!_resultSelected.size) return;
+  if (!confirm(`删除选中的 ${_resultSelected.size} 条结果？`)) return;
+  const ids = Array.from(_resultSelected).join(',');
+  await api(`/api/v1/results?ids=${ids}`, { method: 'DELETE' });
+  toast(`已删除 ${_resultSelected.size} 条结果`); pageResults();
+}
+
+/* ═══════════════════════ 工作空间（VS Code 风格）═══════════════════════ */
+let _wsGid = null, _wsGname = '', _wsPath = '', _wsFile = null, _wsDirty = false;
+let _wsTerm = null, _wsSocket = null, _wsFit = null;
+
+async function openWorkspace(gid, gname) {
+  _wsGid = gid; _wsGname = gname; _wsPath = ''; _wsFile = null; _wsDirty = false;
+  state.page = 'workspace'; render();
+}
+
+async function renderWorkspaceFull() {
+  document.body.style.overflow = 'hidden';
+  // 全屏工作空间：无侧边栏、无 topbar，占满整个视口
+  $('#app').innerHTML = `
+  <div class="ws-layout" style="height:100vh;border-radius:0">
+    <div class="ws-sidebar">
+      <div class="ws-side-header">
+        <span style="cursor:pointer;color:#569cd6" onclick="goto('groups')" title="返回任务组">← ${esc(_wsGname)}</span>
+        <span class="ops">
+          <button onclick="wsNewFile()" title="新建文件">📄+</button>
+          <button onclick="wsNewDir()" title="新建目录">📁+</button>
+          <button onclick="wsLoadTree(_wsPath)" title="刷新">⟳</button>
+        </span>
+      </div>
+      <div class="ws-tree" id="ws-tree"></div>
+    </div>
+    <div class="ws-main">
+      <div class="ws-editor-head">
+        <span class="path" id="ws-editor-path">未打开文件</span>
+        <span class="flex">
+          <button class="btn btn-sm" id="ws-save-btn" style="display:none" onclick="wsSave()">保存 (Ctrl+S)</button>
+          ${state.user.privilege >= 1 ? '<button class="btn btn-sm btn-danger" id="ws-del-btn" style="display:none" onclick="wsDeleteFile()">删除</button>' : ''}
+          <button class="btn btn-sm btn-default" onclick="goto('groups')">返回列表</button>
+        </span>
+      </div>
+      <div class="ws-welcome" id="ws-welcome">
+        <div style="font-size:32px">🗂️</div>
+        <div>从左侧选择文件编辑，或在下方终端中操作</div>
+        <div style="font-size:12px;color:#444">终端 cwd = workspaces/group_${_wsGid}，python 已指向项目 venv</div>
+      </div>
+      <div class="ws-editor" id="ws-editor" style="display:none"><textarea id="ws-textarea" spellcheck="false"></textarea></div>
+      <div class="ws-terminal-wrap" id="ws-term-wrap">
+        <div class="ws-term-header">
+          <span>终端 — group-${ _wsGid} (bash)</span>
+          <span class="ops">
+            <button onclick="wsTermToggle()" id="ws-term-toggle">收起</button>
+            <button onclick="wsTermReconnect()">重连</button>
+          </span>
+        </div>
+        <div id="ws-terminal"></div>
+      </div>
+      <div class="ws-statusbar">
+        <span>group_${_wsGid}</span>
+        <span id="ws-status-msg"></span>
+        <span class="right" id="ws-term-status">终端：连接中...</span>
+        <span class="right">venv: <span id="ws-venv-info">加载中...</span></span>
+      </div>
+    </div>
+  </div>`;
+  await wsLoadTree();
+  wsInitTerminal();
+
+  // Ctrl+S 保存
+  document.getElementById('ws-textarea').addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); wsSave(); }
+  });
+  document.getElementById('ws-textarea').addEventListener('input', () => {
+    if (!_wsDirty) { _wsDirty = true; wsUpdateHeader(); }
+  });
+}
+
+async function wsLoadTree(path = '') {
+  const r = await api(`/api/v1/groups/${_wsGid}/workspace/files?path=${encodeURIComponent(path)}`);
+  _wsPath = r.path;
+  const tree = $('#ws-tree');
+  let html = '';
+  if (r.path) {
+    const parent = r.path.split('/').slice(0, -1).join('/');
+    html += `<div class="tree-item dir" onclick="wsLoadTree('${parent}')"><span class="icon">↩</span>..</div>`;
+  }
+  html += r.entries.map(e => {
+    const icon = e.is_dir ? '📁' : (e.name.endsWith('.py') ? '🐍' : e.name.endsWith('.sh') ? '⚙️' : '📄');
+    const size = e.is_dir ? '' : `<span class="size">${fmtSize(e.size)}</span>`;
+    const click = e.is_dir ? `wsLoadTree('${esc(e.path)}')` : `wsOpenFile('${esc(e.path)}')`;
+    const active = _wsFile === e.path ? ' active' : '';
+    return `<div class="tree-item${e.is_dir ? ' dir' : ''}${active}" onclick="${click}">
+      <span class="icon">${icon}</span>${esc(e.name)}${size}</div>`;
+  }).join('');
+  tree.innerHTML = html || '<div style="padding:16px;color:#555;font-size:12px">空目录</div>';
+}
+
+function fmtSize(n) {
+  if (n < 1024) return n + 'B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1024 / 1024).toFixed(1) + 'M';
+}
+
+async function wsOpenFile(path) {
+  if (_wsDirty && !confirm('当前文件有未保存的修改，放弃？')) return;
+  const r = await api(`/api/v1/groups/${_wsGid}/workspace/file?path=${encodeURIComponent(path)}`);
+  _wsFile = r.path; _wsDirty = false;
+  $('#ws-welcome').style.display = 'none';
+  $('#ws-editor').style.display = 'block';
+  $('#ws-textarea').value = r.content;
+  $('#ws-save-btn').style.display = state.user.privilege >= 1 ? '' : 'none';
+  $('#ws-del-btn') && ($('#ws-del-btn').style.display = '');
+  wsUpdateHeader(); wsLoadTree(_wsPath);
+}
+
+function wsUpdateHeader() {
+  $('#ws-editor-path').innerHTML = esc(_wsFile || '未打开文件') + (_wsDirty ? '<span class="dirty">● 未保存</span>' : '');
+}
+
+async function wsSave() {
+  if (!_wsFile || !_wsDirty) return;
+  await api(`/api/v1/groups/${_wsGid}/workspace/file?path=${encodeURIComponent(_wsFile)}`,
+    { method: 'PUT', body: JSON.stringify({ content: $('#ws-textarea').value }) });
+  _wsDirty = false; wsUpdateHeader();
+  $('#ws-status-msg').textContent = `已保存 ${new Date().toLocaleTimeString('zh-CN')}`;
+  wsLoadTree(_wsPath);
+}
+
+async function wsNewFile() {
+  const name = prompt('新文件名（可含子目录，如 scripts/check.py）:');
+  if (!name) return;
+  await api(`/api/v1/groups/${_wsGid}/workspace/file?path=${encodeURIComponent(name)}`,
+    { method: 'PUT', body: JSON.stringify({ content: '' }) });
+  wsLoadTree(_wsPath); wsOpenFile(name);
+}
+
+async function wsNewDir() {
+  const name = prompt('新目录名（可含多级，如 scripts/lib）:');
+  if (!name) return;
+  await api(`/api/v1/groups/${_wsGid}/workspace/mkdir`,
+    { method: 'POST', body: JSON.stringify({ path: name }) });
+  wsLoadTree(_wsPath);
+}
+
+async function wsDeleteFile() {
+  if (!_wsFile || !confirm(`删除 ${_wsFile}？`)) return;
+  await api(`/api/v1/groups/${_wsGid}/workspace/file?path=${encodeURIComponent(_wsFile)}`, { method: 'DELETE' });
+  _wsFile = null; _wsDirty = false;
+  $('#ws-editor').style.display = 'none';
+  $('#ws-welcome').style.display = 'flex';
+  $('#ws-save-btn').style.display = 'none';
+  $('#ws-del-btn') && ($('#ws-del-btn').style.display = 'none');
+  wsUpdateHeader(); wsLoadTree(_wsPath);
+}
+
+function wsTermToggle() {
+  const w = $('#ws-term-wrap');
+  w.classList.toggle('collapsed');
+  $('#ws-term-toggle').textContent = w.classList.contains('collapsed') ? '展开' : '收起';
+  if (_wsFit && !w.classList.contains('collapsed')) setTimeout(() => _wsFit.fit(), 50);
+}
+
+function wsTermReconnect() {
+  if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
+  if (_wsTerm) { _wsTerm.clear(); }
+  wsInitTerminal();
+}
+
+function wsInitTerminal() {
+  if (typeof Terminal === 'undefined') {
+    $('#ws-terminal').innerHTML = '<div style="color:#f66;padding:20px">xterm.js 加载失败（需要能访问 cdn.jsdelivr.net）</div>';
+    return;
+  }
+  if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; }
+  const term = new Terminal({
+    fontSize: 13, fontFamily: '"SF Mono", Consolas, monospace',
+    cursorBlink: true, scrollback: 5000,
+    theme: { background: '#0c0c0c', foreground: '#d4d4d4' },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($('#ws-terminal'));
+  setTimeout(() => { fit.fit(); }, 100);
+  _wsTerm = term; _wsFit = fit;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/api/v1/groups/${_wsGid}/workspace/terminal?token=${encodeURIComponent(state.token)}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    $('#ws-term-status').textContent = '终端：已连接';
+    ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
+    // 获取 venv python 版本显示在状态栏
+    setTimeout(() => {
+      if (ws.readyState === 1) ws.send('python --version && which python\n');
+    }, 500);
+  };
+  ws.onmessage = e => {
+    if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
+    else term.write(e.data);
+  };
+  ws.onclose = () => { $('#ws-term-status').textContent = '终端：已断开'; term.write('\r\n\x1b[31m[连接已断开]\x1b[0m\r\n'); };
+  ws.onerror = () => { $('#ws-term-status').textContent = '终端：连接错误'; };
+  term.onData(d => { if (ws.readyState === 1) ws.send(d); });
+  term.onResize(({ rows, cols }) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', rows, cols }));
+  });
+  // 窗口大小变化时重算终端尺寸
+  window.addEventListener('resize', () => { if (_wsFit) _wsFit.fit(); });
+  _wsSocket = ws;
+}
+
+/* ═══════════════════════ 弹窗 ═══════════════════════ */
+function showModal(title, bodyHtml, onOk) {
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `<div class="modal"><h3>${title}</h3>${bodyHtml}
+    <div class="footer">
+      <button class="btn btn-default" onclick="this.closest('.modal-mask').remove()">关闭</button>
+      ${onOk ? '<button class="btn" id="modal-ok">确定</button>' : ''}
+    </div></div>`;
+  document.body.appendChild(mask);
+  if (onOk) mask.querySelector('#modal-ok').onclick = async () => {
+    try { const r = await onOk(); if (r !== false) mask.remove(); }
+    catch (e) { toast(e.message, 'error'); }
+  };
+}
+
+/* ═══════════════════════ 启动 ═══════════════════════ */
+(async () => {
+  if (state.token) {
+    try { state.user = await api('/api/v1/auth/me'); }
+    catch { state.token = null; }
+  }
+  render();
+})();
+</script>
+</body>
+</html>
