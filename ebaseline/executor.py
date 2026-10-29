@@ -19,7 +19,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Optional,  Any
 
 from sqlalchemy.orm import Session
 
@@ -78,8 +78,8 @@ def render_variables(text: str, variables: dict[str, Any]) -> str:
     return text.replace("\x00LB\x00", "{").replace("\x00RB\x00", "}")
 
 
-def _run_script(script_path: str, timeout: int = 300, extra_env: dict | None = None,
-                workspace: Path | None = None) -> dict:
+def _run_script(script_path: str, timeout: int = 300, extra_env: Optional[dict] = None,
+                workspace: Optional[Path] = None) -> dict:
     """执行脚本，返回 {returncode, stdout, stderr, success}。
 
     script_path 可以是：
@@ -228,7 +228,7 @@ def _run_script(script_path: str, timeout: int = 300, extra_env: dict | None = N
         }
 
 
-def _parse_depends(depends_str: str | None) -> list[int]:
+def _parse_depends(depends_str: Optional[str]) -> list[int]:
     if not depends_str:
         return []
     return [int(x.strip()) for x in depends_str.split(",") if x.strip()]
@@ -304,7 +304,7 @@ class _TaskLogger:
         self.batch = batch
         self.task = task
         self.lines: list[str] = []
-        self.result_id: int | None = None
+        self.result_id: Optional[int] = None
         # 创建执行中占位记录
         r = crud.create_result(db, batch.sid, batch.gid, task.tid, 3, "")
         self.result_id = r.id

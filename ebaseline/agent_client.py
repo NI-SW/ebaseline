@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import json
 import re
 import threading
@@ -43,7 +45,7 @@ class AgentResult:
     duration_sec: float = 0.0
     rounds: int = 1
     tokens: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-    qa_record: dict | None = None
+    qa_record: Optional[dict] = None
 
 
 def _asks_for_confirmation(text: str) -> bool:
@@ -197,8 +199,8 @@ def run_agent(
     base_url: str,
     api_key: str,
     input_text: str,
-    timeout: int | None = None,
-    qa_missing: list[dict] | None = None,
+    timeout: Optional[int] = None,
+    qa_missing: Optional[list[dict]] = None,
 ) -> AgentResult:
     """调用 Agent API 执行任务。
 

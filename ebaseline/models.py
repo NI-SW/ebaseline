@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import Integer, String, Text, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,7 +19,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     password: Mapped[str] = mapped_column(String(128), nullable=False)
-    email: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     privilege: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0=普通用户(测试权限), 1=管理员(管理任务和任务组), 2=超级管理员(全部权限)
 
@@ -27,9 +28,9 @@ class TaskGroup(Base):
     __tablename__ = "task_group"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    description: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    variables: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON string
+    name: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    variables: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON string
     python_version: Mapped[str] = mapped_column(String(16), nullable=False, default="3.11")  # 工作空间 Python 版本
 
 
@@ -38,13 +39,13 @@ class TaskList(Base):
 
     tid: Mapped[int] = mapped_column(Integer, primary_key=True)
     gid: Mapped[int] = mapped_column(Integer, nullable=False)
-    name: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    description: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    depends: Mapped[str | None] = mapped_column(String(256), nullable=True)  # 逗号分隔的 tid
-    pre_script: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    input: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON string
-    expect: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    clean: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    depends: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)  # 逗号分隔的 tid
+    pre_script: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    input: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON string
+    expect: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    clean: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 class Subject(Base):
@@ -79,7 +80,7 @@ class TaskResult(Base):
     tid: Mapped[int] = mapped_column(Integer, nullable=False)
     result: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0=未执行, 1=执行成功, 2=执行失败
-    process: Mapped[str | None] = mapped_column(Text, nullable=True)
+    process: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     create_time: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, default=datetime.utcnow)
 
 

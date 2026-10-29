@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import Optional,  Any
 
 from mcp.server import FastMCP
 from sqlalchemy.orm import Session
@@ -28,7 +28,7 @@ def _get_db() -> Session:
     return _get_session_factory()()
 
 
-def _task_to_dict(task: models.TaskList, db: Session | None = None) -> dict:
+def _task_to_dict(task: models.TaskList, db: Optional[Session] = None) -> dict:
     depends = None
     if task.depends:
         depends = [int(x.strip()) for x in task.depends.split(",") if x.strip()]
@@ -259,7 +259,7 @@ def get_task_results(batch_id: int) -> str:
 
 
 @mcp.tool()
-def submit_task_result(batch_id: int, tid: int, result: int, process: str | None = None) -> str:
+def submit_task_result(batch_id: int, tid: int, result: int, process: Optional[str] = None) -> str:
     """智能体主动上报任务结果。result: 0=未执行, 1=成功, 2=失败。
 
     用于智能体主导执行模式：智能体通过 MCP 拉取任务、自主执行、上报结果。
