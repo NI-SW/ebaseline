@@ -4,4 +4,5 @@ venv/
 .zcode/
 .env
 *.log
-workspaces/group_*/.venv/
+# 组级工作空间为运行期生成内容，不入库（目录保留在本地）
+workspaces/
