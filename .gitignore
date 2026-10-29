@@ -11,3 +11,5 @@ workspaces/*/__pycache__/
 workspaces/*/output/
 workspaces/*/tmp/
 workspaces/*/*.log
+*.swp
+*.swo
