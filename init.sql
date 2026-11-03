@@ -39,7 +39,7 @@ variables的格式类型：
 create table if not exists ebase.task_list(
 tid int not null primary key,   -- task id
 gid int not null,			    -- group id
-name char(32) ,				    -- 任务名称
+name varchar(128) ,			    -- 任务名称
 description varchar(128),       -- 描述任务行为
 depends varchar(256),           -- 依赖任务id（只能依赖组内任务），表示该任务依赖于其他任务的执行结果，只有在依赖任务执行成功后，才能执行该任务，字段类型为列表，但以字符串形式存储，多个依赖任务id之间用逗号分隔
 pre_script varchar(128),        -- 前置条件脚本地址入口，用户可以选择在线编写脚本或上传脚本，脚本将由系统保存到服务器。
@@ -102,10 +102,13 @@ create_time timestamp default current_timestamp	-- 批次创建时间
 
 create table if not exists ebase.task_result (
 id int not null auto_increment primary key,		-- result id
+batch_id int,                                   -- 所属批次id
 sid int not null,					            -- subject id
 gid int not null,					            -- group id
 tid int not null,					            -- task id
-result int not null default 0,                  -- 执行状态，0为未执行，1为执行成功，2为执行失败
+result int not null default 0,                  -- 执行状态，0为未执行，1为执行成功，2为执行失败，3为执行中
+result_detail int,                              -- 细分结果，2为完全成功，1为校验通过但Agent异常，0为失败
+metrics TEXT,                                   -- 结构化指标JSON：耗时/token/轮次/工具调用/阶段等
 process TEXT,                                   -- 执行结果信息，包含任务执行的详细日志和输出结果
 create_time timestamp default current_timestamp	-- 执行时间
 );

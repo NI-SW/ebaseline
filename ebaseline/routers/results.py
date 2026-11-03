@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .. import crud, models, schemas
 from ..auth import get_current_user, require_privilege
 from ..database import get_db
+from ..metrics import result_summary
 
 router = APIRouter(prefix="/api/v1/results", tags=["results"])
 
@@ -21,31 +22,59 @@ def list_results(
     gid: int | None = None,
     tid: int | None = None,
     result: int | None = None,
+    batch_id: int | None = None,
     db: Session = Depends(get_db),
     _: models.User = Depends(get_current_user),
 ):
-    """查询结果，支持按 sid/gid/tid/result 过滤。"""
-    return crud.list_results(db, sid=sid, gid=gid, tid=tid, result=result)
+    """查询结果，支持按 batch_id/sid/gid/tid/result 过滤。"""
+    results = crud.list_results(db, sid=sid, gid=gid, tid=tid, result=result, batch_id=batch_id)
+    return [
+        {
+            "id": r.id,
+            "batch_id": r.batch_id,
+            "sid": r.sid,
+            "gid": r.gid,
+            "tid": r.tid,
+            "result": r.result,
+            "result_detail": r.result_detail,
+            "metrics": result_summary(r),
+            "process": r.process,
+            "create_time": r.create_time,
+        }
+        for r in results
+    ]
 
 
 @router.get("/export")
 def export_results(
     sid: int | None = None,
     gid: int | None = None,
+    batch_id: int | None = None,
     db: Session = Depends(get_db),
     _: models.User = Depends(get_current_user),
 ):
-    """导出结果为 CSV。"""
-    results = crud.list_results(db, sid=sid, gid=gid)
+    """导出结果为 CSV（可按批次过滤）。"""
+    results = crud.list_results(db, sid=sid, gid=gid, batch_id=batch_id)
     if not results:
         raise HTTPException(status_code=404, detail="没有可导出的结果")
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "sid", "gid", "tid", "result", "process", "create_time"])
+    writer.writerow([
+        "id", "batch_id", "sid", "gid", "tid", "result", "result_detail",
+        "verdict", "duration_sec", "agent_duration_sec", "rounds", "tool_calls",
+        "tokens_input", "tokens_output", "tokens_total", "first_token_ms",
+        "process", "create_time",
+    ])
     for r in results:
+        m = result_summary(r)
+        tokens = m.get("tokens") or {}
         writer.writerow([
-            r.id, r.sid, r.gid, r.tid, r.result,
+            r.id, r.batch_id, r.sid, r.gid, r.tid, r.result, r.result_detail,
+            m.get("verdict"), m.get("duration_sec"), m.get("agent_duration_sec"),
+            m.get("rounds"), m.get("tool_calls"),
+            tokens.get("input"), tokens.get("output"), tokens.get("total"),
+            m.get("first_token_ms"),
             (r.process or "").replace("\n", "\\n"),
             r.create_time.isoformat() if r.create_time else "",
         ])
@@ -69,10 +98,13 @@ def get_result(
         raise HTTPException(status_code=404, detail="结果不存在")
     return {
         "id": r.id,
+        "batch_id": r.batch_id,
         "sid": r.sid,
         "gid": r.gid,
         "tid": r.tid,
         "result": r.result,
+        "result_detail": r.result_detail,
+        "metrics": result_summary(r),
         "process": r.process,
         "create_time": r.create_time.isoformat() if r.create_time else None,
     }

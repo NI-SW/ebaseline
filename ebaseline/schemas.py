@@ -1,10 +1,11 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Optional,  Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Auth ───────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ class TaskGroupResponse(BaseModel):
 # ── Task ───────────────────────────────────────────────────────
 class TaskCreate(BaseModel):
     tid: Optional[int] = None  # 不填则自动分配
-    name: str = Field(..., min_length=1, max_length=32)
+    name: str = Field(..., min_length=1, max_length=128)
     description: Optional[str] = Field(None, max_length=128)
     depends: Optional[list[int]] = None  # 依赖的 tid 列表
     pre_script: Optional[str] = Field(None, max_length=128)
@@ -78,7 +79,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=32)
+    name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = Field(None, max_length=128)
     depends: Optional[list[int]] = None
     pre_script: Optional[str] = Field(None, max_length=128)
@@ -143,24 +144,40 @@ class BatchResponse(BaseModel):
     gid: int
     status: int
     create_time: datetime
+    metrics: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True
 
 
 class BatchDetailResponse(BatchResponse):
-    tasks: Optional[list[dict[str, Any]]] = None  # 包含每个任务的执行状态
+    subject_name: Optional[str] = None
+    group_name: Optional[str] = None
+    tasks: Optional[list[dict[str, Any]]] = None  # 包含每个任务的执行状态与指标
 
 
 # ── Result ─────────────────────────────────────────────────────
 class ResultResponse(BaseModel):
     id: int
+    batch_id: Optional[int] = None
     sid: int
     gid: int
     tid: int
     result: int
+    result_detail: Optional[int] = None
+    metrics: Optional[dict[str, Any]] = None
     process: Optional[str]
     create_time: datetime
+
+    @field_validator("metrics", mode="before")
+    @classmethod
+    def _parse_metrics(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                return None
+        return value
 
     class Config:
         from_attributes = True

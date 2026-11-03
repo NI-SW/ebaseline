@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models, schemas
@@ -53,8 +54,10 @@ def delete_task_group(db: Session, gid: int) -> bool:
     group = get_task_group(db, gid)
     if group is None:
         return False
-    # 级联删除组内任务
+    # 级联删除组内任务、批次与结果（表间无外键，需手动清理）
     db.query(models.TaskList).filter(models.TaskList.gid == gid).delete()
+    db.query(models.TaskBatch).filter(models.TaskBatch.gid == gid).delete()
+    db.query(models.TaskResult).filter(models.TaskResult.gid == gid).delete()
     db.delete(group)
     db.commit()
     return True
@@ -220,10 +223,9 @@ def delete_batch(db: Session, batch_id: int) -> bool:
     batch = get_batch(db, batch_id)
     if batch is None:
         return False
-    # 级联删除该批次的结果
+    # 只删除该批次自己的结果，避免误删同主体/同组的其他批次
     db.query(models.TaskResult).filter(
-        models.TaskResult.sid == batch.sid,
-        models.TaskResult.gid == batch.gid,
+        models.TaskResult.batch_id == batch.id,
     ).delete()
     db.delete(batch)
     db.commit()
@@ -231,21 +233,51 @@ def delete_batch(db: Session, batch_id: int) -> bool:
 
 
 # ── Result ─────────────────────────────────────────────────────
-def create_result(db: Session, sid: int, gid: int, tid: int, result: int, process: str | None) -> models.TaskResult:
-    r = models.TaskResult(sid=sid, gid=gid, tid=tid, result=result, process=process)
+def create_result(
+    db: Session,
+    sid: int,
+    gid: int,
+    tid: int,
+    result: int,
+    process: str | None,
+    batch_id: int | None = None,
+    result_detail: int | None = None,
+    metrics: str | None = None,
+) -> models.TaskResult:
+    r = models.TaskResult(
+        batch_id=batch_id,
+        sid=sid,
+        gid=gid,
+        tid=tid,
+        result=result,
+        result_detail=result_detail,
+        metrics=metrics,
+        process=process,
+    )
     db.add(r)
     db.commit()
     db.refresh(r)
     return r
 
 
-def update_result(db: Session, result_id: int, result: int | None = None, process: str | None = None) -> models.TaskResult | None:
+def update_result(
+    db: Session,
+    result_id: int,
+    result: int | None = None,
+    process: str | None = None,
+    result_detail: int | None = None,
+    metrics: str | None = None,
+) -> models.TaskResult | None:
     """更新已有结果（用于执行中实时追加日志）。"""
     r = get_result(db, result_id)
     if r is None:
         return None
     if result is not None:
         r.result = result
+    if result_detail is not None:
+        r.result_detail = result_detail
+    if metrics is not None:
+        r.metrics = metrics
     if process is not None:
         r.process = process
     db.commit()
@@ -263,8 +295,11 @@ def list_results(
     gid: int | None = None,
     tid: int | None = None,
     result: int | None = None,
+    batch_id: int | None = None,
 ) -> list[models.TaskResult]:
     q = db.query(models.TaskResult)
+    if batch_id is not None:
+        q = q.filter(models.TaskResult.batch_id == batch_id)
     if sid is not None:
         q = q.filter(models.TaskResult.sid == sid)
     if gid is not None:
@@ -276,23 +311,64 @@ def list_results(
     return q.order_by(models.TaskResult.id.desc()).all()
 
 
-def delete_results_by_batch(db: Session, sid: int, gid: int) -> int:
-    """删除指定批次对应的所有结果，返回删除条数。"""
+def list_results_for_batches(db: Session, batch_ids: list[int]) -> list[models.TaskResult]:
+    """一次取出多个批次的结果（批次列表聚合用）。"""
+    if not batch_ids:
+        return []
+    return (
+        db.query(models.TaskResult)
+        .filter(models.TaskResult.batch_id.in_(batch_ids))
+        .order_by(models.TaskResult.id.asc())
+        .all()
+    )
+
+
+def count_tasks_by_gid(db: Session, gids: set[int] | list[int]) -> dict[int, int]:
+    """按任务组统计任务数（批次指标中的“任务数”口径）。"""
+    if not gids:
+        return {}
+    rows = (
+        db.query(models.TaskList.gid, func.count(models.TaskList.tid))
+        .filter(models.TaskList.gid.in_(list(gids)))
+        .group_by(models.TaskList.gid)
+        .all()
+    )
+    return {gid: int(count) for gid, count in rows}
+
+
+def delete_results_by_batch(db: Session, batch_id: int) -> int:
+    """删除指定批次的结果，返回删除条数。"""
     count = db.query(models.TaskResult).filter(
-        models.TaskResult.sid == sid,
-        models.TaskResult.gid == gid,
+        models.TaskResult.batch_id == batch_id,
     ).delete()
     db.commit()
     return count
 
 
-def get_task_result(db: Session, sid: int, gid: int, tid: int) -> models.TaskResult | None:
-    """获取某批次中某任务的最新结果。"""
+def get_task_result(
+    db: Session,
+    sid: int,
+    gid: int,
+    tid: int,
+    batch_id: int | None = None,
+) -> models.TaskResult | None:
+    """获取某任务的最新结果；指定 batch_id 时只在该批次内查找。"""
+    q = db.query(models.TaskResult).filter(
+        models.TaskResult.sid == sid,
+        models.TaskResult.gid == gid,
+        models.TaskResult.tid == tid,
+    )
+    if batch_id is not None:
+        q = q.filter(models.TaskResult.batch_id == batch_id)
+    return q.order_by(models.TaskResult.id.desc()).first()
+
+
+def get_batch_task_result(db: Session, batch_id: int, tid: int) -> models.TaskResult | None:
+    """获取批次内某任务的最新结果。"""
     return (
         db.query(models.TaskResult)
         .filter(
-            models.TaskResult.sid == sid,
-            models.TaskResult.gid == gid,
+            models.TaskResult.batch_id == batch_id,
             models.TaskResult.tid == tid,
         )
         .order_by(models.TaskResult.id.desc())

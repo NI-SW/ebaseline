@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from . import crud, executor, models
 from .database import _get_session_factory
 from .executor import render_variables
+from .metrics import result_summary
 
 mcp = FastMCP("ebaseline", stateless_http=True)
 
@@ -244,12 +245,16 @@ def get_task_results(batch_id: int) -> str:
         tasks = crud.list_tasks(db, gid=batch.gid)
         results = []
         for task in tasks:
-            r = crud.get_task_result(db, batch.sid, batch.gid, task.tid)
+            r = crud.get_batch_task_result(db, batch_id, task.tid)
+            summary = result_summary(r) if r else None
             results.append({
                 "tid": task.tid,
                 "name": task.name,
                 "result": r.result if r else 0,
-                "result_text": {0: "未执行", 1: "成功", 2: "失败"}.get(r.result if r else 0, "未知"),
+                "result_detail": r.result_detail if r else None,
+                "verdict": summary["verdict"] if summary else "PENDING",
+                "verdict_text": summary["verdict_text"] if summary else "未执行",
+                "metrics": summary,
                 "process": (r.process or "")[:2000] if r else None,
                 "create_time": r.create_time.isoformat() if r else None,
             })
@@ -282,6 +287,14 @@ def submit_task_result(batch_id: int, tid: int, result: int, process: Optional[s
             tid=tid,
             result=result,
             process=process,
+            batch_id=batch_id,
+            result_detail=2 if result == 1 else (0 if result == 2 else None),
+            metrics=json.dumps({
+                "metrics_version": 2,
+                "stage": "manual",
+                "agent_success": result == 1,
+                "expect_success": result == 1,
+            }, ensure_ascii=False),
         )
         return json.dumps({
             "result_id": r.id,
@@ -302,7 +315,7 @@ def export_batch_csv(batch_id: int) -> str:
         batch = crud.get_batch(db, batch_id)
         if batch is None:
             return json.dumps({"error": f"批次 {batch_id} 不存在"}, ensure_ascii=False)
-        results = crud.list_results(db, sid=batch.sid, gid=batch.gid)
+        results = crud.list_results(db, batch_id=batch_id)
         if not results:
             return json.dumps({"error": "批次无结果"}, ensure_ascii=False)
 
@@ -310,10 +323,21 @@ def export_batch_csv(batch_id: int) -> str:
         import io
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["id", "sid", "gid", "tid", "result", "process", "create_time"])
+        writer.writerow([
+            "id", "batch_id", "sid", "gid", "tid", "result", "result_detail",
+            "verdict", "duration_sec", "agent_duration_sec", "rounds", "tool_calls",
+            "tokens_input", "tokens_output", "tokens_total", "first_token_ms",
+            "process", "create_time",
+        ])
         for r in results:
+            m = result_summary(r)
+            tokens = m.get("tokens") or {}
             writer.writerow([
-                r.id, r.sid, r.gid, r.tid, r.result,
+                r.id, r.batch_id, r.sid, r.gid, r.tid, r.result, r.result_detail,
+                m.get("verdict"), m.get("duration_sec"), m.get("agent_duration_sec"),
+                m.get("rounds"), m.get("tool_calls"),
+                tokens.get("input"), tokens.get("output"), tokens.get("total"),
+                m.get("first_token_ms"),
                 (r.process or "").replace("\n", "\\n"),
                 r.create_time.isoformat() if r.create_time else "",
             ])

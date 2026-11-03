@@ -32,6 +32,10 @@ def main():
 
     cfg = load_config(args.config)
 
+    # 建表 + 补齐新增列（兼容已有库）
+    from ebaseline.models import create_all
+    create_all()
+
     print(f"[ebaseline] 配置文件: {cfg.path}")
     print(f"[ebaseline] 数据库: {cfg.db_user}@{cfg.db_host}:{cfg.db_port}/{cfg.db_schema}")
     print(f"[ebaseline] REST API: http://{cfg.server_host}:{cfg.server_port}")

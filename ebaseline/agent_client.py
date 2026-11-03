@@ -45,6 +45,10 @@ class AgentResult:
     duration_sec: float = 0.0
     rounds: int = 1
     tokens: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+    usage_seen: bool = False          # 是否真的从响应里拿到了 usage（缺失时不能按 0 计）
+    tool_calls: int = 0               # 工具调用次数（跨轮累加）
+    tool_names: list[str] = field(default_factory=list)
+    first_token_ms: Optional[int] = None  # 首字延迟（发起请求 → 首个文本增量）
     qa_record: Optional[dict] = None
 
 
@@ -129,15 +133,40 @@ def _run_agent_once(
     headers: dict,
     payload: dict,
     deadline: float,
+    origin: Optional[float] = None,
 ) -> dict:
-    """单轮 Agent 调用：POST /v1/responses，处理 SSE 流。"""
+    """单轮 Agent 调用：POST /v1/responses，处理 SSE 流。
+
+    origin 为整个任务开始时间；首字延迟按它计算，避免多轮时被低估。
+    """
+    origin = origin or time.time()
     result = {
         "text": "",
         "error": None,
         "final_payload": None,
         "usage": {},
+        "usage_seen": False,
+        "tool_calls": 0,
+        "tool_names": [],
+        "first_token_ms": None,
     }
     text_parts: list[str] = []
+    first_delta_at: Optional[float] = None
+    seen_tool_ids: set[str] = set()
+
+    def _record_tool(item) -> None:
+        """统计工具调用（同一 item 的 added/done 不重复计数）。"""
+        if not isinstance(item, dict) or item.get("type") not in ("function_call", "mcp_call"):
+            return
+        key = str(item.get("id") or item.get("call_id") or item.get("name") or "")
+        if key and key in seen_tool_ids:
+            return
+        if key:
+            seen_tool_ids.add(key)
+        result["tool_calls"] += 1
+        name = item.get("name")
+        if name and str(name) not in result["tool_names"]:
+            result["tool_names"].append(str(name))
 
     def _on_timeout():
         result["error"] = "Agent 调用超时"
@@ -145,6 +174,8 @@ def _run_agent_once(
     def _finalize():
         """确保 text 字段始终被设置。"""
         result["text"] = "".join(text_parts)
+        if first_delta_at is not None:
+            result["first_token_ms"] = int((first_delta_at - origin) * 1000)
         return result
 
     timer = threading.Timer(max(1, deadline - time.time()), _on_timeout)
@@ -174,12 +205,22 @@ def _run_agent_once(
                     continue
                 event_type = event.get("type", "")
 
-                if event_type == "response.output_text.delta":
+                if event_type == "response.output_item.done":
+                    _record_tool(event.get("item"))
+                elif event_type == "response.output_text.delta":
+                    if first_delta_at is None:
+                        first_delta_at = time.time()
                     delta = event.get("delta", "")
                     text_parts.append(delta)
                 elif event_type == "response.completed":
                     result["final_payload"] = event
-                    result["usage"] = event.get("response", {}).get("usage", {})
+                    response = event.get("response", {}) or {}
+                    usage = response.get("usage", {}) or {}
+                    result["usage"] = usage
+                    result["usage_seen"] = bool(usage)
+                    # 有些链路只在最终 payload 的 output 里给出工具调用
+                    for item in response.get("output") or []:
+                        _record_tool(item)
                     return _finalize()
                 elif event_type == "response.error":
                     err = event.get("error", {})
@@ -241,6 +282,10 @@ def run_agent(
     text_parts: list[str] = []
     follow_ups = 0
     token_totals: dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage_seen = False
+    tool_calls_total = 0
+    tool_names: list[str] = []
+    first_token_ms: Optional[int] = None
     qa_fed: set[str] = set()
     qa_record: dict = {
         "requested_fields": [m["field"] for m in (qa_missing or [])],
@@ -249,10 +294,25 @@ def run_agent(
         "fed_fields": [],
     } if qa_mode else {}
 
+    def _token_snapshot() -> dict:
+        tokens = dict(token_totals)
+        if usage_seen and not tokens.get("total_tokens"):
+            tokens["total_tokens"] = (tokens.get("input_tokens") or 0) + (tokens.get("output_tokens") or 0)
+        return tokens
+
     while True:
-        result = _run_agent_once(url, headers, payload, deadline)
+        result = _run_agent_once(url, headers, payload, deadline, start_time)
         text_parts.append(result["text"])
+        if result.get("usage_seen"):
+            usage_seen = True
         _accumulate_usage(token_totals, result.get("usage") or {})
+        tool_calls_total += int(result.get("tool_calls") or 0)
+        for name in result.get("tool_names") or []:
+            if name not in tool_names:
+                tool_names.append(name)
+        if result.get("first_token_ms") is not None:
+            first_token_ms = (result["first_token_ms"] if first_token_ms is None
+                              else min(first_token_ms, result["first_token_ms"]))
 
         if result["error"]:
             if follow_ups > 0 and text_parts[0]:
@@ -265,7 +325,11 @@ def run_agent(
                 returncode=-1,
                 duration_sec=round(time.time() - start_time, 1),
                 rounds=follow_ups + 1,
-                tokens=dict(token_totals),
+                tokens=_token_snapshot(),
+                usage_seen=usage_seen,
+                tool_calls=tool_calls_total,
+                tool_names=tool_names,
+                first_token_ms=first_token_ms,
                 qa_record=qa_record if qa_mode else None,
             )
 
@@ -281,7 +345,11 @@ def run_agent(
                 returncode=-1,
                 duration_sec=round(time.time() - start_time, 1),
                 rounds=follow_ups + 1,
-                tokens=dict(token_totals),
+                tokens=_token_snapshot(),
+                usage_seen=usage_seen,
+                tool_calls=tool_calls_total,
+                tool_names=tool_names,
+                first_token_ms=first_token_ms,
                 qa_record=qa_record if qa_mode else None,
             )
 
@@ -336,7 +404,11 @@ def run_agent(
         returncode=0,
         duration_sec=round(time.time() - start_time, 1),
         rounds=follow_ups + 1,
-        tokens=dict(token_totals),
+        tokens=_token_snapshot(),
+        usage_seen=usage_seen,
+        tool_calls=tool_calls_total,
+        tool_names=tool_names,
+        first_token_ms=first_token_ms,
     )
     if qa_mode:
         qa_record["fed_fields"] = sorted(qa_fed)

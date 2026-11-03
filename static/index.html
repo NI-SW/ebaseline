@@ -73,6 +73,15 @@ input:focus, textarea:focus { border-color: #1890ff; outline: none; }
 .detail-grid dt { color: #999; }
 .detail-grid dd { word-break: break-all; }
 .mono { font-family: Consolas, monospace; font-size: 13px; }
+/* ── 批次指标 ── */
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.metric { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 6px; padding: 12px 14px; }
+.metric .label { font-size: 12px; color: #999; }
+.metric .value { font-size: 20px; font-weight: 600; margin-top: 4px; color: #262626; }
+.metric .sub { font-size: 11px; color: #999; margin-top: 2px; }
+.table-wrap { overflow-x: auto; }
+.flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.flex-between { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* ── 全屏日志查看器 ── */
 .fullscreen-log { position: fixed; inset: 0; background: #0d1117; z-index: 200; display: flex; flex-direction: column; }
 .fullscreen-log .log-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; }
@@ -135,9 +144,24 @@ const state = { token: localStorage.getItem('eb_token'), user: null, page: 'grou
 function toast(msg, type = 'success') {
   const el = document.createElement('div');
   el.className = `toast ${type}`;
-  el.textContent = msg;
+  el.textContent = typeof msg === 'string' ? msg : (JSON.stringify(msg) ?? String(msg));
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 2500);
+}
+
+// FastAPI 校验错误（422）的 detail 是数组，直接塞进 Error 会变成 "[object Object]"
+function formatApiDetail(detail) {
+  if (detail === null || detail === undefined || detail === '') return '';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) return detail.map(formatApiDetail).filter(Boolean).join('；');
+  if (typeof detail === 'object') {
+    if (detail.msg) {
+      const loc = Array.isArray(detail.loc) ? detail.loc.filter(x => x !== 'body').join('.') : '';
+      return loc ? `${loc}: ${detail.msg}` : detail.msg;
+    }
+    return detail.message || JSON.stringify(detail);
+  }
+  return String(detail);
 }
 
 async function api(path, opts = {}) {
@@ -152,7 +176,7 @@ async function api(path, opts = {}) {
   if (res.status === 401) { logout(); throw new Error('未登录'); }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(formatApiDetail(data?.detail) || `HTTP ${res.status}`);
   return data;
 }
 
@@ -171,6 +195,69 @@ const BATCH_STATUS = { 0: ['未执行','tag-gray'], 1: ['执行中','tag-blue'],
 const RESULT_TEXT = { 0: ['未执行','tag-gray'], 1: ['成功','tag-green'], 2: ['失败','tag-red'], 3: ['执行中','tag-blue'] };
 // 任务细分结果（从 process 中解析 result_detail）
 const RESULT_DETAIL = { 2: ['成功','tag-green'], 1: ['校验通过(Agent异常)','tag-orange'], 0: ['失败','tag-red'] };
+// 五态判定
+const VERDICT = {
+  PASS: ['通过','tag-green'],
+  PARTIAL: ['部分通过','tag-orange'],
+  FAIL: ['失败','tag-red'],
+  SKIP: ['跳过','tag-gray'],
+  ERROR: ['异常','tag-red'],
+  RUNNING: ['执行中','tag-blue'],
+  PENDING: ['未执行','tag-gray'],
+};
+
+function verdictTag(v) {
+  const [txt, cls] = VERDICT[v] || ['未知','tag-gray'];
+  return `<span class="tag ${cls}">${txt}</span>`;
+}
+
+function fmtInt(v) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  return Math.round(Number(v)).toLocaleString('zh-CN');
+}
+
+function fmtNum(v, digits = 1) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  return Number(v).toFixed(digits);
+}
+
+function fmtSec(v) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  return Number(v).toFixed(1) + 's';
+}
+
+function fmtTok(v) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  const n = Number(v);
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+function fmtMs(v) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  const n = Number(v);
+  return n >= 1000 ? (n / 1000).toFixed(1) + 's' : Math.round(n) + 'ms';
+}
+
+function fmtPct(v) {
+  if (v === null || v === undefined || isNaN(v)) return '-';
+  return (Number(v) * 100).toFixed(1) + '%';
+}
+
+function metricCard(label, value, sub = '', title = '') {
+  return `<div class="metric"${title ? ` title="${esc(title)}"` : ''}>
+    <div class="label">${label}</div>
+    <div class="value">${value}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ''}
+  </div>`;
+}
+
+function resultTag(r) {
+  if (r && r.verdict) return verdictTag(r.verdict);
+  const [rt, rc] = getResultTag(r?.result ?? 0, r?.process);
+  return `<span class="tag ${rc}">${rt}</span>`;
+}
 
 function parseResultDetail(process) {
   if (!process) return null;
@@ -242,7 +329,13 @@ function render() {
   loadPage();
 }
 
-function goto(p) { state.page = p; state.detail = null; if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; } if (_wsSocket) { _wsSocket.close(); _wsSocket = null; } render(); }
+function goto(p) {
+  state.page = p; state.detail = null;
+  if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
+  if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; }
+  if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
+  render();
+}
 
 async function loadPage() {
   const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults }[state.page];
@@ -276,8 +369,8 @@ async function pageGroups() {
 function showGroupModal(g) {
   const isEdit = !!g;
   showModal(`${isEdit ? '编辑' : '新建'}任务组`, `
-    <div class="form-item"><label>名称</label><input id="g_name" value="${esc(g?.name || '')}"></div>
-    <div class="form-item"><label>描述</label><input id="g_desc" value="${esc(g?.description || '')}"></div>
+    <div class="form-item"><label>名称</label><input id="g_name" value="${esc(g?.name || '')}" maxlength="32"></div>
+    <div class="form-item"><label>描述</label><input id="g_desc" value="${esc(g?.description || '')}" maxlength="128"></div>
     <div class="form-item"><label>Python 版本（工作空间独立 venv）</label>
       <select id="g_pyver">
         <option value="3.9" ${g?.python_version === '3.9' ? 'selected' : ''}>Python 3.9 (系统)</option>
@@ -298,7 +391,7 @@ function showGroupModal(g) {
 }
 
 async function delGroup(gid) {
-  if (!confirm('删除任务组将级联删除组内任务，确认？')) return;
+  if (!confirm('删除任务组将级联删除组内任务、批次和结果记录，并删除工作空间目录（不可恢复），确认？')) return;
   await api(`/api/v1/groups/${gid}`, { method: 'DELETE' });
   toast('已删除'); pageGroups();
 }
@@ -354,13 +447,13 @@ function showTaskModal(gid, t) {
   const isEdit = !!t;
   showModal(`${isEdit ? '编辑' : '新建'}任务`, `
     ${isEdit ? '' : '<div class="form-item"><label>TID（留空自动分配）</label><input id="t_tid" placeholder="自动"></div>'}
-    <div class="form-item"><label>名称</label><input id="t_name" value="${esc(t?.name || '')}"></div>
-    <div class="form-item"><label>描述</label><input id="t_desc" value="${esc(t?.description || '')}"></div>
-    <div class="form-item"><label>依赖（逗号分隔的 tid）</label><input id="t_deps" value="${(t?.depends || []).join(',')}"></div>
-    <div class="form-item"><label>前置脚本</label><input id="t_pre" value="${esc(t?.pre_script || '')}" placeholder="check_xxx.py --arg"></div>
+    <div class="form-item"><label>名称</label><input id="t_name" value="${esc(t?.name || '')}" maxlength="128"></div>
+    <div class="form-item"><label>描述</label><input id="t_desc" value="${esc(t?.description || '')}" maxlength="128"></div>
+    <div class="form-item"><label>依赖（逗号分隔的 tid）</label><input id="t_deps" value="${(t?.depends || []).join(',')}" maxlength="256"></div>
+    <div class="form-item"><label>前置脚本</label><input id="t_pre" value="${esc(t?.pre_script || '')}" placeholder="check_xxx.py --arg" maxlength="128"></div>
     <div class="form-item"><label>输入（JSON：{prompt, conversation?}）</label><textarea id="t_input" rows="6">${esc(t?.input ? JSON.stringify(t.input, null, 2) : '{"prompt": ""}')}</textarea></div>
-    <div class="form-item"><label>校验脚本</label><input id="t_expect" value="${esc(t?.expect || '')}"></div>
-    <div class="form-item"><label>清理脚本</label><input id="t_clean" value="${esc(t?.clean || '')}"></div>
+    <div class="form-item"><label>校验脚本</label><input id="t_expect" value="${esc(t?.expect || '')}" maxlength="128"></div>
+    <div class="form-item"><label>清理脚本</label><input id="t_clean" value="${esc(t?.clean || '')}" maxlength="128"></div>
   `, async () => {
     let inputObj = null;
     const rawInput = $('#t_input').value.trim();
@@ -410,8 +503,8 @@ async function pageSubjects() {
 function showSubjectModal(s) {
   const isEdit = !!s;
   showModal(`${isEdit ? '编辑' : '注册'}待测 Agent`, `
-    <div class="form-item"><label>名称 / 代号</label><input id="s_name" value="${esc(s?.name || '')}" placeholder="如：生产环境 Hermes Agent"></div>
-    <div class="form-item"><label>IP 地址</label><input id="s_ip" value="${esc(s?.ipaddr || '')}" placeholder="192.168.34.65"></div>
+    <div class="form-item"><label>名称 / 代号</label><input id="s_name" value="${esc(s?.name || '')}" placeholder="如：生产环境 Hermes Agent" maxlength="32"></div>
+    <div class="form-item"><label>IP 地址</label><input id="s_ip" value="${esc(s?.ipaddr || '')}" placeholder="192.168.34.65" maxlength="32"></div>
     <div class="form-item"><label>端口</label><input id="s_port" type="number" value="${s?.port || 58642}"></div>
     <div class="form-item"><label>API Key</label><input id="s_secret" value="" placeholder="${isEdit ? '留空则不修改' : ''}"></div>
     <div class="form-item"><label>API 模式</label><select id="s_mode"><option value="0" ${s?.api_mode === 0 ? 'selected' : ''}>OpenAI Responses API</option></select></div>
@@ -444,23 +537,27 @@ async function pageBatches() {
   $('#content').innerHTML = `
   <div class="card">
     <div class="flex-between"><h2>批次列表</h2><button class="btn" onclick='showBatchModal(${JSON.stringify(subjects)}, ${JSON.stringify(groups)})'>+ 创建批次</button></div>
-    <table><thead><tr><th>ID</th><th>待测主体</th><th>任务组</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>ID</th><th>待测主体</th><th>任务组</th><th>状态</th><th>任务数</th><th>通过率</th><th>平均耗时</th><th>创建时间</th><th>操作</th></tr></thead>
     <tbody>${batches.map(b => {
       const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+      const m = b.metrics || {};
       return `<tr>
         <td>${b.id}</td>
         <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
         <td>${esc(groupMap[b.gid] || `gid=${b.gid}`)}</td>
         <td><span class="tag ${cls}">${txt}</span></td>
+        <td>${fmtInt(m.task_count)}</td>
+        <td>${fmtPct(m.strict_pass_rate)}</td>
+        <td>${fmtSec(m.duration_avg)}</td>
         <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
         <td>
-          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id})">详情</button>
+          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id}, 'batches')">详情</button>
           ${b.status !== 1 ? `<button class="btn btn-sm btn-success" onclick="runBatch(${b.id})">执行</button>` :
             `<button class="btn btn-sm btn-danger" onclick="cancelBatch(${b.id})">取消</button>`}
-          ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id})">删除</button>` : ''}
+          ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'batches')">删除</button>` : ''}
         </td></tr>`;
-    }).join('') || '<tr><td colspan="6" class="empty">暂无批次</td></tr>'}
-    </tbody></table>
+    }).join('') || '<tr><td colspan="9" class="empty">暂无批次</td></tr>'}
+    </tbody></table></div>
   </div>`;
 }
 
@@ -489,44 +586,82 @@ async function cancelBatch(bid) {
   toast('已发送取消信号'); setTimeout(pageBatches, 800);
 }
 
-async function delBatch(bid) {
+async function delBatch(bid, fromPage = 'batches') {
   if (!confirm(`删除批次 #${bid} 将同时删除该批次的所有执行结果，确认？`)) return;
   await api(`/api/v1/batches/${bid}`, { method: 'DELETE' });
-  toast('批次已删除'); pageBatches();
+  toast('批次已删除');
+  if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
+  goto(fromPage === 'results' ? 'results' : 'batches');
 }
 
-async function batchDetail(bid) {
+async function batchDetail(bid, fromPage = 'batches') {
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
   const b = await api(`/api/v1/batches/${bid}`);
   const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+  const m = b.metrics || {};
+  $('#page-title').textContent = `批次 #${b.id} 详情`;
   $('#content').innerHTML = `
   <div class="card">
     <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span></h2>
-      <div class="flex"><button class="btn btn-default" onclick="pageBatches()">返回</button>
-      <button class="btn btn-default" onclick="batchDetail(${bid})">刷新</button></div></div>
+      <div class="flex">
+        <button class="btn btn-default" onclick="goto('${fromPage}')">返回</button>
+        <button class="btn btn-default" onclick="batchDetail(${bid}, '${fromPage}')">刷新</button>
+        <button class="btn btn-default" onclick="exportBatchCsv(${bid})">导出 CSV</button>
+        ${state.user.privilege >= 1 ? `<button class="btn btn-danger" onclick="delBatch(${bid}, '${fromPage}')">删除批次</button>` : ''}
+      </div></div>
     <dl class="detail-grid">
       <dt>批次 ID</dt><dd>${b.id}</dd>
-      <dt>待测主体</dt><dd class="mono">sid=${b.sid}</dd>
-      <dt>任务组</dt><dd>gid=${b.gid}</dd>
+      <dt>待测主体</dt><dd class="mono">${esc(b.subject_name || `sid=${b.sid}`)}</dd>
+      <dt>任务组</dt><dd>${esc(b.group_name || `gid=${b.gid}`)}</dd>
       <dt>创建时间</dt><dd class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</dd>
     </dl>
   </div>
-  <div class="card"><h2>任务执行状态</h2>
-    <table><thead><tr><th>TID</th><th>任务</th><th>结果</th><th>完成时间</th><th>操作</th></tr></thead>
+  <div class="card"><h2>批次指标</h2>
+    <div class="metric-grid">
+      ${metricCard('任务数', fmtInt(m.task_count), `已记录 ${fmtInt(m.result_count)}`)}
+      ${metricCard('通过 / 部分 / 失败 / 跳过', `${fmtInt(m.pass)} / ${fmtInt(m.partial)} / ${fmtInt(m.fail)} / ${fmtInt(m.skip)}`, `执行中 ${fmtInt(m.running)}，未执行 ${fmtInt(m.pending)}`)}
+      ${metricCard('严格通过率', fmtPct(m.strict_pass_rate), `含 PARTIAL ${fmtPct(m.pass_rate)}`)}
+      ${metricCard('平均耗时', fmtSec(m.duration_avg), `P95 ${fmtSec(m.duration_p95)}（${fmtInt(m.duration_samples)} 样本）`, 'P95 取升序第 min(n-1, int(n*0.95)) 个；样本少时等于最慢一次')}
+      ${metricCard('平均 Agent 耗时', fmtSec(m.agent_duration_avg), `${fmtInt(m.agent_duration_samples)} 样本`)}
+      ${metricCard('平均模型往返', fmtNum(m.rounds_avg), `${fmtInt(m.rounds_samples)} 样本`)}
+      ${metricCard('平均工具调用', fmtNum(m.tool_calls_avg), `${fmtInt(m.tool_call_samples)} 样本`)}
+      ${metricCard('平均 Token', fmtTok(m.tokens_avg), `${fmtInt(m.token_samples)} 有效样本`)}
+      ${metricCard('Token 总量', fmtTok(m.tokens_total), '缺失不计入均值')}
+      ${metricCard('首字延迟 P95', fmtMs(m.first_token_p95), `${fmtInt(m.first_token_samples)} 样本`)}
+    </div>
+  </div>
+  <div class="card"><h2>任务执行结果</h2>
+    <div class="table-wrap"><table>
+    <thead><tr><th>TID</th><th>任务</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
     <tbody>${(b.tasks || []).map(t => {
-      const [rt, rc] = getResultTag(t.result, t.process);
-      return `<tr><td class="mono">${t.tid}</td><td>${esc(t.name)}</td>
-        <td><span class="tag ${rc}">${rt}</span></td>
+      const tm = t.metrics || {};
+      const token = tm.tokens
+        ? `${fmtTok(tm.tokens.input)} / ${fmtTok(tm.tokens.output)} / ${fmtTok(tm.tokens.total)}`
+        : '-';
+      const toolTitle = esc((tm.tool_names || []).join(', '));
+      const logBtn = t.result_id
+        ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${t.result_id}, '任务 ${t.tid} 执行日志', ${t.result === 3})">${t.result === 3 ? '实时日志' : '查看日志'}</button>`
+        : '-';
+      return `<tr>
+        <td class="mono">${t.tid}</td>
+        <td>${esc(t.name)}</td>
+        <td>${resultTag(t)}</td>
+        <td>${fmtSec(tm.duration_sec)}</td>
+        <td>${fmtSec(tm.agent_duration_sec)}</td>
+        <td>${fmtNum(tm.rounds, 0)}</td>
+        <td${toolTitle ? ` title="${toolTitle}"` : ''}>${fmtInt(tm.tool_calls)}</td>
+        <td class="mono">${token}</td>
+        <td>${fmtMs(tm.first_token_ms)}</td>
         <td class="mono">${t.create_time ? new Date(t.create_time).toLocaleString('zh-CN') : '-'}</td>
-        <td>${(t.process || t.result === 0 || t.result === 3) ? `<button class="btn btn-sm btn-default" onclick="viewLog(${t.tid}, ${b.sid}, ${b.gid})">${t.result === 3 ? '实时日志' : '查看日志'}</button>` : ''}</td></tr>`;
-    }).join('')}
-    </tbody></table>
+        <td>${logBtn}</td></tr>`;
+    }).join('') || '<tr><td colspan="11" class="empty">暂无任务</td></tr>'}
+    </tbody></table></div>
   </div>`;
   // 批次执行中时每 3 秒自动刷新
   if (b.status === 1) {
     _batchDetailTimer = setInterval(() => {
       if ($('#page-title') && document.querySelector('.fullscreen-log') === null) {
-        batchDetail(bid);
+        batchDetail(bid, fromPage);
       }
     }, 3000);
   }
@@ -622,92 +757,73 @@ function closeLogViewer() {
   document.body.style.overflow = '';
 }
 
-async function viewLog(tid, sid, gid) {
-  const results = await api(`/api/v1/results?sid=${sid}&gid=${gid}&tid=${tid}`);
-  if (!results.length) { toast('暂无日志', 'error'); return; }
-  const r = results[0];
-  // 任务未执行完（result=0 或 3）时开启实时刷新
-  openLogViewer(r.id, `任务 ${tid} 执行日志`, r.result === 0 || r.result === 3);
-}
-
-/* ═══════════════════════ 结果 ═══════════════════════ */
-let _resultSelected = new Set();
-
-async function pageResults() {
-  $('#page-title').textContent = '执行结果';
-  _resultSelected.clear();
-  const results = await api('/api/v1/results');
-  const canEdit = state.user.privilege >= 1;
-  $('#content').innerHTML = `
-  <div class="card">
-    <div class="flex-between">
-      <h2>结果列表</h2>
-      <div class="flex">
-        ${canEdit ? '<button class="btn btn-danger btn-sm" onclick="delSelectedResults()" id="del-selected-btn" style="display:none">删除选中</button>' : ''}
-        <button class="btn btn-default" onclick="exportCsv()">导出 CSV</button>
-      </div>
-    </div>
-    <table><thead><tr>
-      ${canEdit ? '<th><input type="checkbox" onchange="toggleSelectAll(this)"></th>' : ''}
-      <th>ID</th><th>SID</th><th>GID</th><th>TID</th><th>结果</th><th>时间</th><th>操作</th></tr></thead>
-    <tbody>${results.map(r => {
-      const [rt, rc] = getResultTag(r.result, r.process);
-      return `<tr>
-        ${canEdit ? `<td><input type="checkbox" class="result-cb" data-id="${r.id}" onchange="toggleResultSelect(${r.id}, this.checked)"></td>` : ''}
-        <td>${r.id}</td><td class="mono">${r.sid}</td><td class="mono">${r.gid}</td>
-        <td class="mono">${r.tid}</td><td><span class="tag ${rc}">${rt}</span></td>
-        <td class="mono">${new Date(r.create_time).toLocaleString('zh-CN')}</td>
-        <td>
-          ${(r.process || r.result === 0 || r.result === 3) ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${r.id}, '结果 #${r.id} 日志', ${r.result === 0 || r.result === 3})">${r.result === 3 ? '实时日志' : '日志'}</button>` : ''}
-          ${canEdit ? `<button class="btn btn-sm btn-danger" onclick="delResult(${r.id})">删除</button>` : ''}
-        </td></tr>`;
-    }).join('') || `<tr><td colspan="${canEdit ? 8 : 7}" class="empty">暂无结果</td></tr>`}
-    </tbody></table>
-  </div>`;
-}
-
-async function exportCsv() {
-  const res = await fetch('/api/v1/results/export', {
+async function exportBatchCsv(bid) {
+  const res = await fetch(`/api/v1/results/export?batch_id=${bid}`, {
     headers: { 'Authorization': `Bearer ${state.token}` },
   });
-  if (!res.ok) { toast('导出失败', 'error'); return; }
+  if (!res.ok) { toast('导出失败（批次可能没有结果）', 'error'); return; }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `results_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `batch_${bid}_results_${new Date().toISOString().slice(0, 10)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
   toast('CSV 已下载');
 }
 
-function toggleSelectAll(cb) {
-  const checked = cb.checked;
-  document.querySelectorAll('.result-cb').forEach(el => {
-    el.checked = checked;
-    toggleResultSelect(parseInt(el.dataset.id), checked);
-  });
-}
+/* ═══════════════════════ 执行结果（批次）═══════════════════════ */
+async function pageResults() {
+  if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
+  $('#page-title').textContent = '执行结果';
+  const [batches, subjects, groups] = await Promise.all([
+    api('/api/v1/batches'), api('/api/v1/subjects'), api('/api/v1/groups')]);
+  const subjMap = Object.fromEntries(subjects.map(s => [s.id, `${s.name || s.ipaddr + ':' + s.port}`]));
+  const groupMap = Object.fromEntries(groups.map(g => [g.id, g.name]));
+  const canEdit = state.user.privilege >= 1;
 
-function toggleResultSelect(id, checked) {
-  if (checked) _resultSelected.add(id);
-  else _resultSelected.delete(id);
-  const btn = $('#del-selected-btn');
-  if (btn) btn.style.display = _resultSelected.size > 0 ? '' : 'none';
-}
-
-async function delResult(id) {
-  if (!confirm(`删除结果 #${id}？`)) return;
-  await api(`/api/v1/results/${id}`, { method: 'DELETE' });
-  toast('已删除'); pageResults();
-}
-
-async function delSelectedResults() {
-  if (!_resultSelected.size) return;
-  if (!confirm(`删除选中的 ${_resultSelected.size} 条结果？`)) return;
-  const ids = Array.from(_resultSelected).join(',');
-  await api(`/api/v1/results?ids=${ids}`, { method: 'DELETE' });
-  toast(`已删除 ${_resultSelected.size} 条结果`); pageResults();
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between">
+      <h2>批次执行结果</h2>
+      <div class="flex"><button class="btn btn-default" onclick="pageResults()">刷新</button></div>
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>批次</th><th>待测主体</th><th>任务组</th><th>状态</th>
+      <th>任务数</th><th>通过</th><th>部分</th><th>失败</th><th>跳过</th>
+      <th>严格通过率</th><th>含 PARTIAL</th><th>平均耗时</th><th>P95 耗时</th>
+      <th>平均 Token</th><th>Token 样本</th><th>平均往返</th><th>平均工具</th>
+      <th>创建时间</th><th>操作</th>
+    </tr></thead>
+    <tbody>${batches.map(b => {
+      const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+      const m = b.metrics || {};
+      return `<tr>
+        <td>#${b.id}</td>
+        <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
+        <td>${esc(groupMap[b.gid] || `gid=${b.gid}`)}</td>
+        <td><span class="tag ${cls}">${txt}</span></td>
+        <td>${fmtInt(m.task_count)}</td>
+        <td><span class="tag tag-green">${fmtInt(m.pass)}</span></td>
+        <td><span class="tag tag-orange">${fmtInt(m.partial)}</span></td>
+        <td><span class="tag tag-red">${fmtInt(m.fail)}</span></td>
+        <td><span class="tag tag-gray">${fmtInt(m.skip)}</span></td>
+        <td>${fmtPct(m.strict_pass_rate)}</td>
+        <td>${fmtPct(m.pass_rate)}</td>
+        <td>${fmtSec(m.duration_avg)}</td>
+        <td>${fmtSec(m.duration_p95)}</td>
+        <td>${fmtTok(m.tokens_avg)}</td>
+        <td>${fmtInt(m.token_samples)}</td>
+        <td>${fmtNum(m.rounds_avg)}</td>
+        <td>${fmtNum(m.tool_calls_avg)}</td>
+        <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
+        <td>
+          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id}, 'results')">详情</button>
+          ${canEdit ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'results')">删除</button>` : ''}
+        </td></tr>`;
+    }).join('') || '<tr><td colspan="19" class="empty">暂无批次结果</td></tr>'}
+    </tbody></table></div>
+  </div>`;
 }
 
 /* ═══════════════════════ 工作空间（VS Code 风格）═══════════════════════ */
