@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import pty
+import shutil
 import signal
 import struct
 import subprocess
@@ -45,6 +46,13 @@ def _workspace_dir(gid: int) -> Path:
     d = WORKSPACES_ROOT / f"group_{gid}"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def delete_workspace(gid: int) -> None:
+    """删除组工作空间目录（不存在时静默返回）。"""
+    d = WORKSPACES_ROOT / f"group_{gid}"
+    if d.exists():
+        shutil.rmtree(d)
 
 
 def _venv_dir(gid: int) -> Path:
@@ -223,7 +231,6 @@ def delete_file(
     if target == base:
         raise HTTPException(status_code=400, detail="不能删除工作空间根目录")
     if target.is_dir():
-        import shutil
         shutil.rmtree(target)
     else:
         target.unlink()
