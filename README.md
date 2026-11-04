@@ -268,6 +268,8 @@ eb.report(ok=True, detail={...})  # 输出 JSON 并按 ok 设置退出码
 - `expect` 阶段仍会同时通过 stdin 传入 Agent 回答，旧脚本无需改动
 - 上下文文件不含待测主体的 API key，但**包含组变量**（可能含密码），勿随意外传
 
+完整的 API 说明、上下文 JSON 结构与故障排查见 [docs/ebaseline_sdk.md](docs/ebaseline_sdk.md)。
+
 ## 配置文件
 
 ```json

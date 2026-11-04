@@ -82,6 +82,7 @@ workspaces/group_<gid>/  # 组级工作空间（独立 venv + 脚本 + 文件）
 - `expect` 阶段仍向 stdin 写 Agent 回答，旧脚本零改动兼容
 - 手工调试：Web 终端里 `EBASE_GID` 已注入，SDK 退化为读该组最近一次执行；
   `python ebaseline_sdk.py --dump` 可查看完整快照
+- 完整 API 文档：`docs/ebaseline_sdk.md`
 
 ### MCP 工具
 

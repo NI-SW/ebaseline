@@ -177,10 +177,9 @@ def context_for(tid: int) -> dict:
 
 
 def available() -> bool:
-    """当前是否能解析到上下文。"""
+    """当前是否能解析到可读的上下文文件。"""
     try:
-        context_path()
-        return True
+        return context_path().is_file()
     except ContextUnavailable:
         return False
 
@@ -363,7 +362,12 @@ def _main(argv: list[str]) -> int:
     tids = [a for a in argv if a.isdigit()]
     try:
         tid = int(tids[0]) if tids else None
-        ctx = context_for(tid) if tid is not None else context()
+        if tid is not None:
+            ctx = context_for(tid)
+            shown_path = Path(context_path()).parent / f"{tid}.json"
+        else:
+            ctx = context()
+            shown_path = context_path()
     except SDKError as e:
         print(f"[ebaseline-sdk] {e}", file=sys.stderr)
         return 2
@@ -373,7 +377,7 @@ def _main(argv: list[str]) -> int:
         return 0
 
     agent_info = ctx.get("agent") or {}
-    print(f"context : {context_path()}")
+    print(f"context : {shown_path}")
     print(f"batch   : {ctx.get('batch_id')}  sid={ctx.get('sid')}  gid={ctx.get('gid')}  tid={ctx.get('tid')}")
     print(f"task    : {(ctx.get('task') or {}).get('name')}")
     print(f"stage   : {ctx.get('stage')}")
