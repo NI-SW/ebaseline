@@ -30,9 +30,11 @@ ebaseline/
   crud.py                # 通用 CRUD
   agent_client.py        # Agent /v1/responses SSE 流式调用（自动追问 + QA 闭环）
   executor.py            # 任务执行引擎（依赖拓扑排序 → pre_script → Agent → expect → clean）
+  runtime.py             # 运行上下文快照（runtime/ebase_runs/...，供脚本 SDK 读取）
   mcp_server.py          # MCP 服务（FastMCP streamable HTTP，12 个工具）
   routers/               # REST API 路由
     auth.py users.py groups.py tasks.py subjects.py batches.py results.py workspace.py
+ebaseline_sdk.py         # 脚本侧 SDK（单文件、纯标准库；读运行上下文，无需安装）
 scripts/                 # 全局校验脚本（check_db_node.py 等）
   lib/console_mcp.py     # i2up 控制台 MCP 客户端（复用自 stream-agent）
 seeds/                   # 数据导入脚本（import_db2_group.py, sync_db2_all.py）
@@ -67,6 +69,19 @@ workspaces/group_<gid>/  # 组级工作空间（独立 venv + 脚本 + 文件）
 - 脚本优先从组工作空间解析，找不到再回退到全局 `scripts/`
 - 组变量自动注入为环境变量（如 `DB2_NODE_SRC_IP`）
 - Web 终端（WebSocket + pty）cwd 固定在工作空间，PATH 前置组 venv
+
+### 运行上下文与脚本 SDK
+
+- 每个任务在每个阶段把快照原子写入 `runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.json`
+  （`<tid>.qa.json` 存 QA 闭环记录；`runtime/` 已加入 `.gitignore`）
+- 执行器注入 `EBASE_RUN_FILE` / `EBASE_RUN_DIR` / `EBASE_BATCH_ID` / `EBASE_GID` /
+  `EBASE_TID` / `EBASE_STAGE` / `EBASE_RUNTIME_ROOT`，并把项目根加入 `PYTHONPATH`
+- 工作空间脚本 `import ebaseline_sdk as eb`，可用
+  `agent_output()` / `agent()` / `qa_record()` / `stage()` / `task()` /
+  `variable()` / `result()` / `agent_output(tid)`（读上游任务输出）/ `results()` / `report()`
+- `expect` 阶段仍向 stdin 写 Agent 回答，旧脚本零改动兼容
+- 手工调试：Web 终端里 `EBASE_GID` 已注入，SDK 退化为读该组最近一次执行；
+  `python ebaseline_sdk.py --dump` 可查看完整快照
 
 ### MCP 工具
 

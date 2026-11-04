@@ -23,7 +23,7 @@ from typing import Optional,  Any
 
 from sqlalchemy.orm import Session
 
-from . import crud, models
+from . import crud, models, runtime
 from .agent_client import run_agent
 from .config import get_config
 from .database import _get_session_factory
@@ -189,6 +189,11 @@ def _run_script(script_path: str, timeout: int = 300, extra_env: Optional[dict] 
 
     import os
     env = os.environ.copy()
+    # 项目根加入 PYTHONPATH：脚本可直接 import ebaseline_sdk
+    project_root = str(Path(__file__).resolve().parent.parent)
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = project_root + (os.pathsep + existing_path if existing_path else "")
+    env["EBASE_RUNTIME_ROOT"] = str(runtime.RUNTIME_ROOT)
     # 组变量注入
     if extra_env:
         env.update(extra_env)
@@ -305,6 +310,140 @@ def _base_metrics(start_time: float, **extra: Any) -> dict:
     return data
 
 
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+class _RunContext:
+    """任务运行上下文快照。
+
+    每个阶段把最新状态原子写入 runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.json，
+    工作空间脚本通过 ebaseline_sdk 读取，不必依赖 stdin 或自行查库。
+    下游任务读取上游输出时，直接读同目录的 <tid>.json。
+    """
+
+    def __init__(self, batch: models.TaskBatch, group: models.TaskGroup,
+                 task: models.TaskList):
+        self.path = runtime.task_context_path(batch.gid, batch.id, task.tid)
+        self.run_dir = runtime.batch_dir(batch.gid, batch.id)
+        self.qa_path = runtime.qa_record_path(batch.gid, batch.id, task.tid)
+        self.batch_id = batch.id
+        self.sid = batch.sid
+        self.gid = batch.gid
+        self.tid = task.tid
+
+        self.group_vars: dict = {}
+        if group.variables:
+            try:
+                self.group_vars = json.loads(group.variables)
+            except json.JSONDecodeError:
+                self.group_vars = {}
+
+        self.data: dict[str, Any] = {
+            "schema_version": runtime.SCHEMA_VERSION,
+            "batch_id": batch.id,
+            "sid": batch.sid,
+            "gid": batch.gid,
+            "tid": task.tid,
+            "stage": "start",
+            "updated_at": _now_iso(),
+            "task": {
+                "tid": task.tid,
+                "gid": task.gid,
+                "name": task.name,
+                "description": task.description,
+                "depends": _parse_depends(task.depends),
+                "pre_script": task.pre_script,
+                "expect": task.expect,
+                "clean": task.clean,
+                "timeout": task.timeout,
+            },
+            "group": {"id": group.id, "name": group.name, "variables": self.group_vars},
+            "prompt": "",
+            "agent": None,
+            "pre_script": None,
+            "expect": None,
+            "clean": None,
+            "result": None,
+            "truncated": [],
+        }
+        self._flush("start")
+
+    def _flush(self, stage: str, **sections: Any) -> None:
+        self.data["stage"] = stage
+        self.data["updated_at"] = _now_iso()
+        self.data.update(sections)
+        try:
+            runtime.write_context(self.path, self.data)
+        except OSError:
+            # 上下文写失败不应中断任务执行（脚本会退化为读 stdin）
+            pass
+
+    def script_env(self, stage: str) -> dict[str, str]:
+        """脚本阶段的 EBASE_* 环境变量。"""
+        env = {
+            "EBASE_RUN_FILE": str(self.path),
+            "EBASE_RUN_DIR": str(self.run_dir),
+            "EBASE_BATCH_ID": str(self.batch_id),
+            "EBASE_SID": str(self.sid),
+            "EBASE_GID": str(self.gid),
+            "EBASE_TID": str(self.tid),
+            "EBASE_STAGE": stage,
+        }
+        if self.qa_path.exists():
+            env["EBASE_QA_FILE"] = str(self.qa_path)
+            env["I2STREAM_AGENT_QA_FILE"] = str(self.qa_path)  # 兼容旧校验脚本
+        return env
+
+    def set_prompt(self, prompt: str) -> None:
+        self._flush("render", prompt=prompt)
+
+    def set_agent(self, agent_result) -> None:
+        output, truncated = runtime.cap_text(agent_result.output)
+        self.data["agent"] = {
+            "success": agent_result.success,
+            "output": output,
+            "error": agent_result.error,
+            "returncode": agent_result.returncode,
+            "duration_sec": agent_result.duration_sec,
+            "rounds": agent_result.rounds,
+            "tokens": agent_result.tokens,
+            "usage_seen": agent_result.usage_seen,
+            "tool_calls": agent_result.tool_calls,
+            "tool_names": agent_result.tool_names,
+            "first_token_ms": agent_result.first_token_ms,
+            "qa_record": agent_result.qa_record,
+        }
+        if truncated:
+            self.data["truncated"].append("agent.output")
+        self._flush("agent")
+        if agent_result.qa_record:
+            try:
+                runtime.write_json(self.qa_path, agent_result.qa_record)
+            except OSError:
+                pass
+
+    def enter(self, stage: str) -> None:
+        """进入某阶段（脚本启动前调用，使 stage() 反映正在运行的阶段）。"""
+        self._flush(stage)
+
+    def set_script_result(self, name: str, result: Optional[dict], stage: str) -> None:
+        """记录某阶段脚本结果（pre_script/expect/clean）。"""
+        if result is None:
+            self._flush(stage)
+            return
+        section = {
+            "returncode": result.get("returncode"),
+            "stdout": runtime.cap_text(result.get("stdout") or "")[0],
+            "stderr": runtime.cap_text(result.get("stderr") or "")[0],
+            "success": result.get("success"),
+        }
+        self._flush(stage, **{name: section})
+
+    def finish(self, result: dict) -> None:
+        self._flush("done", result=result)
+
+
 class _TaskLogger:
     """任务执行日志器：实时写库 + 内存缓冲。
 
@@ -370,6 +509,9 @@ def _execute_single_task(
     logger.log(f"=== 任务 {task.tid} ({task.name}) 开始执行 ===")
     logger.log(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # 运行上下文：每阶段落盘，供工作空间脚本通过 ebaseline_sdk 读取
+    ctx = _RunContext(batch, group, task)
+
     # 1. 检查依赖
     logger.log("\n--- 阶段 1: 检查依赖 ---")
     ok, reason = _check_dependencies(db, batch, task)
@@ -377,6 +519,15 @@ def _execute_single_task(
     if not ok:
         metrics = _base_metrics(start_time, stage="dependency", reason=reason)
         logger.finish(2, metrics=metrics)
+        ctx.finish({
+            "ok": False,
+            "result": 2,
+            "result_detail": None,
+            "verdict": result_verdict(2, None, metrics),
+            "stage": "dependency",
+            "reason": reason,
+            "metrics": metrics,
+        })
         return {
             "success": False,
             "result_detail": None,
@@ -389,12 +540,7 @@ def _execute_single_task(
         }
 
     # 解析组变量（前置/Agent/校验/清理阶段都可能用到）
-    group_vars: dict = {}
-    if group.variables:
-        try:
-            group_vars = json.loads(group.variables)
-        except json.JSONDecodeError:
-            pass
+    group_vars = ctx.group_vars
     # 将组变量拍平为环境变量注入脚本子进程（如 DB2_NODE_SRC_IP=192.168.34.8）
     script_env = _flatten_vars(group_vars) if group_vars else None
 
@@ -402,29 +548,49 @@ def _execute_single_task(
     from .routers.workspace import _workspace_dir
     workspace = _workspace_dir(batch.gid)
 
+    def stage_env(stage: str) -> Optional[dict]:
+        """组变量 + 运行上下文环境变量。"""
+        env = dict(script_env or {})
+        env.update(ctx.script_env(stage))
+        return env
+
     # 2. 执行前置脚本
     pre_result = None
     if task.pre_script:
         logger.log(f"\n--- 阶段 2: 前置脚本 ---\n命令: {task.pre_script}\n工作目录: {workspace}")
+        ctx.enter("pre_script")
         pre_result = _run_script(task.pre_script, timeout=cfg.agent_default_timeout,
-                                 extra_env=script_env, workspace=workspace)
+                                 extra_env=stage_env("pre_script"), workspace=workspace)
         logger.log(f"返回码: {pre_result['returncode']}")
         if pre_result["stdout"]:
             logger.log(f"stdout: {pre_result['stdout'][:2000]}")
         if pre_result["stderr"]:
             logger.log(f"stderr: {pre_result['stderr'][:2000]}")
+        ctx.set_script_result("pre_script", pre_result, "pre_script")
         if not pre_result["success"]:
             # 前置失败也要执行 clean
             if task.clean:
                 logger.log("\n--- 阶段 C: 清理脚本（前置失败后执行）---")
-                clean_result = _run_script(task.clean, extra_env=script_env, workspace=workspace)
+                ctx.enter("clean")
+                clean_result = _run_script(task.clean, extra_env=stage_env("clean"),
+                                           workspace=workspace)
                 logger.log(f"返回码: {clean_result['returncode']}")
+                ctx.set_script_result("clean", clean_result, "clean")
             metrics = _base_metrics(
                 start_time,
                 stage="pre_script",
                 pre_script_returncode=pre_result["returncode"],
             )
             logger.finish(2, metrics=metrics)
+            ctx.finish({
+                "ok": False,
+                "result": 2,
+                "result_detail": None,
+                "verdict": result_verdict(2, None, metrics),
+                "stage": "pre_script",
+                "reason": f"前置脚本失败 (returncode={pre_result['returncode']})",
+                "metrics": metrics,
+            })
             return {
                 "success": False,
                 "result_detail": None,
@@ -445,6 +611,15 @@ def _execute_single_task(
         except json.JSONDecodeError as e:
             metrics = _base_metrics(start_time, stage="parse_input", reason=str(e))
             logger.finish(2, result_detail=0, metrics=metrics)
+            ctx.finish({
+                "ok": False,
+                "result": 2,
+                "result_detail": 0,
+                "verdict": result_verdict(2, 0, metrics),
+                "stage": "parse_input",
+                "reason": f"input JSON 解析失败: {e}",
+                "metrics": metrics,
+            })
             return {
                 "success": False,
                 "result_detail": 0,
@@ -459,6 +634,7 @@ def _execute_single_task(
     prompt_template = input_data.get("prompt", "")
     prompt = render_variables(prompt_template, group_vars)
     logger.log(f"prompt: {prompt[:500]}{'...' if len(prompt) > 500 else ''}")
+    ctx.set_prompt(prompt)
 
     conversation = input_data.get("conversation", [])
     qa_missing = None
@@ -509,6 +685,9 @@ def _execute_single_task(
         logger.log(f"错误: {agent_result.error}")
     logger.log(f"输出: {agent_result.output[:2000]}{'...' if len(agent_result.output) > 2000 else ''}")
 
+    # 落盘完整输出 + qa_record，供 expect/clean/下游任务脚本通过 SDK 读取
+    ctx.set_agent(agent_result)
+
     agent_success = agent_result.success
 
     # 5. 执行 expect 校验脚本
@@ -517,8 +696,9 @@ def _execute_single_task(
     if task.expect:
         logger.log(f"\n--- 阶段 5: 期望校验 ---\n命令: {task.expect}")
         logger.log(f"通过 stdin 传入 Agent 回答（{len(agent_result.output)} 字符）")
+        ctx.enter("expect")
         expect_result = _run_script(task.expect, timeout=cfg.agent_default_timeout,
-                                    extra_env=script_env, workspace=workspace,
+                                    extra_env=stage_env("expect"), workspace=workspace,
                                     stdin_text=agent_result.output)
         expect_results.append(expect_result)
         logger.log(f"返回码: {expect_result['returncode']}")
@@ -528,13 +708,16 @@ def _execute_single_task(
             logger.log(f"stderr: {expect_result['stderr'][:2000]}")
         expect_success = expect_result["success"]
         logger.log(f"校验结果: {'通过' if expect_success else '失败'}")
+        ctx.set_script_result("expect", expect_result, "expect")
 
     # 6. 执行 clean 脚本（总是执行）
     clean_result = None
     if task.clean:
         logger.log(f"\n--- 阶段 6: 清理脚本 ---\n命令: {task.clean}")
-        clean_result = _run_script(task.clean, extra_env=script_env, workspace=workspace)
+        ctx.enter("clean")
+        clean_result = _run_script(task.clean, extra_env=stage_env("clean"), workspace=workspace)
         logger.log(f"返回码: {clean_result['returncode']}")
+        ctx.set_script_result("clean", clean_result, "clean")
 
     overall_success = agent_success and expect_success
 
@@ -588,6 +771,18 @@ def _execute_single_task(
         metrics=task_metrics,
     )
 
+    # 运行上下文收尾：下游任务/事后排查可直接读该文件
+    ctx.finish({
+        "ok": result_detail == 2,
+        "result": 1 if result_detail == 2 else 2,
+        "result_detail": result_detail,
+        "verdict": result_verdict(1 if result_detail == 2 else 2, result_detail, task_metrics),
+        "agent_success": agent_success,
+        "expect_success": expect_success,
+        "metrics": task_metrics,
+        "duration_sec": task_metrics["duration_sec"],
+    })
+
     return {
         "success": overall_success,
         "result_detail": result_detail,
@@ -632,8 +827,10 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
         tasks = crud.list_tasks(db, gid=batch.gid)
         sorted_tasks = _topological_sort(tasks)
 
-        # 清除该批次的旧结果（重跑场景）
+        # 清除该批次的旧结果与运行上下文（重跑场景）
         crud.delete_results_by_batch(db, batch.id)
+        runtime.reset_batch(batch.gid, batch.id)
+        runtime.prune_batches(batch.gid)
 
         total = len(sorted_tasks)
         success_count = 0

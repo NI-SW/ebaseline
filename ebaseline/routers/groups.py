@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import crud, models, schemas
+from .. import crud, models, runtime, schemas
 from ..auth import get_current_user, require_privilege
 from ..database import get_db
 from .workspace import delete_workspace
@@ -88,7 +88,7 @@ def delete_group(
     db: Session = Depends(get_db),
     _: models.User = Depends(require_privilege(1)),
 ):
-    """删除任务组（级联删除组内任务、批次与结果，并清理工作空间目录）。"""
+    """删除任务组（级联删除组内任务、批次与结果，并清理工作空间与运行上下文）。"""
     if not crud.delete_task_group(db, gid):
         raise HTTPException(status_code=404, detail="任务组不存在")
     # 数据库记录已提交，目录清理失败不影响删除结果，仅记录日志便于手工处理
@@ -96,3 +96,7 @@ def delete_group(
         delete_workspace(gid)
     except OSError:
         logger.warning("删除任务组 %s 的工作空间目录失败", gid, exc_info=True)
+    try:
+        runtime.purge_group(gid)
+    except OSError:
+        logger.warning("删除任务组 %s 的运行上下文失败", gid, exc_info=True)

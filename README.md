@@ -81,6 +81,7 @@ ebaseline/
 │   ├── crud.py              # 通用 CRUD
 │   ├── agent_client.py      # Agent /v1/responses SSE 调用
 │   ├── executor.py          # 任务执行引擎（异步线程池）
+│   ├── runtime.py           # 运行上下文快照（runtime/ 下，供 SDK 读取）
 │   ├── mcp_server.py        # MCP 服务（FastMCP streamable HTTP）
 │   └── routers/             # REST API 路由
 │       ├── auth.py          # POST /auth/register, /auth/login
@@ -90,6 +91,7 @@ ebaseline/
 │       ├── subjects.py      # CRUD /subjects
 │       ├── batches.py       # CRUD /batches + POST /batches/{id}/run
 │       └── results.py       # GET /results + GET /results/export
+├── ebaseline_sdk.py         # 脚本侧 SDK（单文件、纯标准库，读运行上下文）
 ├── scripts/                 # 校验脚本
 │   ├── lib/console_mcp.py   # i2up 控制台 MCP 客户端
 │   └── check_db_node.py     # 数据库节点状态检查
@@ -236,6 +238,35 @@ ebaseline/
 
 系统会自动将任务组变量拍平为环境变量注入脚本进程，例如：
 - `DB2_NODE_SRC.ip` → `DB2_NODE_SRC_IP=192.168.34.8`
+
+### 用 SDK 读取 Agent 输出（推荐）
+
+执行器把每个任务的运行上下文写进 `runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.json`，
+脚本通过 `ebaseline_sdk`（单文件、纯标准库、无需在组 venv 里安装）直接读取：
+
+```python
+import ebaseline_sdk as eb
+
+eb.agent_output()               # 当前任务 Agent 的完整回答
+eb.agent()                      # success/error/rounds/tokens/tool_calls/qa_record
+eb.qa_record()                  # QA 闭环记录（探测到/喂回的字段）
+eb.stage()                      # pre_script / agent / expect / clean / done
+eb.task()                       # tid/gid/name/depends/...
+eb.variable("DB2_NODE_SRC.ip")  # 组变量按路径取值
+eb.result()                     # 当前任务结果；未收尾时返回 pending/RUNNING
+eb.agent_output(dep_tid)        # 读取本批次上游任务的输出
+eb.result(dep_tid)              # 读取上游任务结果
+eb.results()                    # 本批次所有任务的执行摘要
+eb.report(ok=True, detail={...})  # 输出 JSON 并按 ok 设置退出码
+```
+
+要点：
+- 执行器注入 `EBASE_RUN_FILE`、`EBASE_RUN_DIR`、`EBASE_TID`、`EBASE_STAGE` 等环境变量，
+  并把项目根加入 `PYTHONPATH`，脚本无需配置即可 `import ebaseline_sdk`
+- 在 Web 终端里手工调试时退化为「该组最近一次执行」的上下文，
+  也可直接运行 `python ebaseline_sdk.py --dump` 查看完整快照
+- `expect` 阶段仍会同时通过 stdin 传入 Agent 回答，旧脚本无需改动
+- 上下文文件不含待测主体的 API key，但**包含组变量**（可能含密码），勿随意外传
 
 ## 配置文件
 

@@ -297,6 +297,13 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
     env["PATH"] = f"{venv_bin}:" + env.get("PATH", "")
     env["EBASE_GID"] = str(gid)
     env["EBASE_WORKSPACE"] = str(ws_dir)
+    # 运行上下文 SDK：脚本可直接 import ebaseline_sdk / 调试时读该组最近一次执行
+    from .. import runtime
+    env["EBASE_RUNTIME_ROOT"] = str(runtime.RUNTIME_ROOT)
+    project_root = str(WORKSPACES_ROOT.parent)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = project_root + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else "")
     env["TERM"] = "xterm-256color"
     env["PS1"] = f"\\[\\e[32m\\]group-{gid}\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]$ "
 

@@ -2,12 +2,14 @@
 """
 检查智能体是否在缺失字段场景下主动索取了信息、且框架已把正确值喂回（问答闭环）。
 
-读取 run_agent 落盘的交互记录 JSON（qa_record），断言：
+qa_record 来源（按顺序）：
+  1. ebaseline_sdk.qa_record() —— 执行器把记录写进运行上下文，SDK 直接读取
+  2. --qa-file 指定的 JSON
+  3. 环境变量 EBASE_QA_FILE / I2STREAM_AGENT_QA_FILE（兼容旧框架）
+
+断言：
   --expect-field F   detected_fields 或 fed_fields 含字段 F（智能体确实索取了 F）
   --expect-fed       至少喂回过一个字段（闭环生效，而非智能体自行猜测）
-
-交互记录来源：test_i2stream 主流程把 agent_result["qa_record"] 写入
-output/<type>/testN_agent_qa.json，并经环境变量 I2STREAM_AGENT_QA_FILE 传递路径。
 
 用法: python check_agent_asked.py --expect-field password [--expect-fed]
        [--qa-file PATH] [--output-format json|text]
@@ -24,16 +26,37 @@ import sys
 
 
 def _load_qa_record(qa_file: str | None) -> dict | None:
-    path = qa_file or os.environ.get("I2STREAM_AGENT_QA_FILE", "")
-    if not path:
-        return None
-    if not os.path.exists(path):
+    if qa_file:
+        return _read_json(qa_file)
+
+    # 首选 SDK：执行器通过 EBASE_RUN_FILE 注入的上下文里带 qa_record
+    try:
+        import ebaseline_sdk as eb
+
+        record = eb.qa_record()
+        if record:
+            return record
+    except Exception:  # SDK 不可用或没有上下文时退化为下面两种来源
+        pass
+
+    for key in ("EBASE_QA_FILE", "I2STREAM_AGENT_QA_FILE"):
+        path = os.environ.get(key, "")
+        if path:
+            record = _read_json(path)
+            if record is not None:
+                return record
+    return None
+
+
+def _read_json(path: str) -> dict | None:
+    if not path or not os.path.exists(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def check_agent_asked(expect_fields: list[str], expect_fed: bool,
@@ -44,7 +67,8 @@ def check_agent_asked(expect_fields: list[str], expect_fed: bool,
             "check_result": "FAIL",
             "error": "未找到问答交互记录（qa_record）——"
                      "智能体可能从未进入索取流程，或框架未落盘记录",
-            "qa_file": qa_file or os.environ.get("I2STREAM_AGENT_QA_FILE", ""),
+            "qa_file": qa_file or os.environ.get("EBASE_QA_FILE")
+                       or os.environ.get("I2STREAM_AGENT_QA_FILE", ""),
         }
 
     detected = record.get("detected_fields") or []
@@ -86,7 +110,7 @@ def main() -> int:
     parser.add_argument("--expect-fed", action="store_true",
                         help="断言至少喂回过一个字段（闭环生效）")
     parser.add_argument("--qa-file", default=None,
-                        help="qa_record JSON 路径（默认读环境变量 I2STREAM_AGENT_QA_FILE）")
+                        help="qa_record JSON 路径（默认从 SDK / EBASE_QA_FILE 读取）")
     parser.add_argument("--output-format", choices=["json", "text"], default="json")
     args = parser.parse_args()
 

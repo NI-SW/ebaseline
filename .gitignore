@@ -17,3 +17,6 @@ workspaces/*/*.log
 # 全局校验脚本与组工作空间中的受跟踪副本重复，不入库（本地保留作兜底）
 scripts/check_db_node.py
 scripts/lib/console_mcp.py
+
+# 运行上下文（任务快照，供 ebaseline_sdk 读取）
+runtime/
