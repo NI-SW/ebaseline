@@ -20,7 +20,8 @@ create table if not exists ebase.task_group (
 id int not null auto_increment primary key,
 name char(32),              
 description varchar(128),   -- 描述组行为
-variables TEXT              -- 组内变量，表示该组内所有任务共享的变量，字段类型为json，但以字符串形式存储，多个变量之间用逗号分隔
+variables TEXT,             -- 组内变量，表示该组内所有任务共享的变量，字段类型为json，但以字符串形式存储，多个变量之间用逗号分隔
+python_version char(16) not null default '3.11'  -- 组工作空间使用的 Python 版本
 );
 /*
 任务组，一个任务组内包含多个任务，任务组的作用是将多个任务组合在一起，方便管理和执行。每个任务组可以有一个名称和描述，用于标识和说明该组的用途。
@@ -44,6 +45,7 @@ description varchar(128),       -- 描述任务行为
 depends varchar(256),           -- 依赖任务id（只能依赖组内任务），表示该任务依赖于其他任务的执行结果，只有在依赖任务执行成功后，才能执行该任务，字段类型为列表，但以字符串形式存储，多个依赖任务id之间用逗号分隔
 pre_script varchar(128),        -- 前置条件脚本地址入口，用户可以选择在线编写脚本或上传脚本，脚本将由系统保存到服务器。
 input TEXT,                     -- 输入参数，应为自然语言，该参数将作为提示词发送给agent
+timeout int default null,       -- Agent 调用超时（秒），NULL 表示使用全局默认值
 expect varchar(128),            -- 期望输出结果校验脚本，用户可以根据实际情况编写期望输出结果校验脚本，用于判断任务是否执行成功，返回值约定：0为任务成功，1为任务失败
 clean varchar(128)              -- 环境清理脚本地址入口，用户可以选择在线编写脚本或上传脚本，脚本将由系统保存到服务器。
 );
@@ -70,6 +72,7 @@ clean varchar(128)              -- 环境清理脚本地址入口，用户可以
 
 create table if not exists ebase.subjects (
 id      int not null auto_increment    primary key,					-- subject id
+name    char(32)      not null default '',                          -- 名称/代号
 ipaddr 	char(32)      not null default '127.0.0.1',	                -- agent ipaddr
 port	int           not	null default 8642,			            -- agent port
 secret	varchar(128)  not null default '',			                -- apikey

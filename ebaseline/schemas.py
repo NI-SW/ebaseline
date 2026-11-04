@@ -73,7 +73,8 @@ class TaskCreate(BaseModel):
     description: Optional[str] = Field(None, max_length=128)
     depends: Optional[list[int]] = None  # 依赖的 tid 列表
     pre_script: Optional[str] = Field(None, max_length=128)
-    input: Optional[dict[str, Any]] = None  # {prompt, conversation?, timeout?}
+    input: Optional[dict[str, Any]] = None  # {prompt, conversation?}
+    timeout: Optional[int] = Field(None, ge=1, le=86400)  # Agent 调用超时（秒），None=全局默认
     expect: Optional[str] = Field(None, max_length=128)
     clean: Optional[str] = Field(None, max_length=128)
 
@@ -84,6 +85,7 @@ class TaskUpdate(BaseModel):
     depends: Optional[list[int]] = None
     pre_script: Optional[str] = Field(None, max_length=128)
     input: Optional[dict[str, Any]] = None
+    timeout: Optional[int] = Field(None, ge=1, le=86400)  # 显式传 null 可恢复全局默认
     expect: Optional[str] = Field(None, max_length=128)
     clean: Optional[str] = Field(None, max_length=128)
 
@@ -96,6 +98,7 @@ class TaskResponse(BaseModel):
     depends: Optional[list[int]]
     pre_script: Optional[str]
     input: Optional[dict[str, Any]]
+    timeout: Optional[int] = None
     expect: Optional[str]
     clean: Optional[str]
 

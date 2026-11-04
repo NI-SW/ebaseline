@@ -469,17 +469,25 @@ def _execute_single_task(
             for c in conversation if isinstance(c, dict)
         ]
 
-    # 任务级超时覆盖：input.timeout > config.agent.default_timeout
-    task_timeout = input_data.get("timeout")
-    if task_timeout is not None:
-        try:
-            task_timeout = int(task_timeout)
-        except (TypeError, ValueError):
-            task_timeout = None
-    agent_timeout = task_timeout if task_timeout else cfg.agent_default_timeout
+    # 任务级超时：task.timeout > input.timeout（旧字段，兼容） > config.agent.default_timeout
+    agent_timeout = task.timeout
+    timeout_source = "任务设置"
+    if not agent_timeout or agent_timeout <= 0:
+        legacy_timeout = input_data.get("timeout")
+        if legacy_timeout is not None:
+            try:
+                legacy_timeout = int(legacy_timeout)
+            except (TypeError, ValueError):
+                legacy_timeout = None
+        if legacy_timeout and legacy_timeout > 0:
+            agent_timeout = legacy_timeout
+            timeout_source = "input.timeout（旧字段）"
+        else:
+            agent_timeout = cfg.agent_default_timeout
+            timeout_source = "全局默认"
 
     # 4. 调用 Agent
-    logger.log(f"\n--- 阶段 4: 调用 Agent ---\n目标: {subject.ipaddr}:{subject.port}\n超时: {agent_timeout}s")
+    logger.log(f"\n--- 阶段 4: 调用 Agent ---\n目标: {subject.ipaddr}:{subject.port}\n超时: {agent_timeout}s（{timeout_source}）")
     agent_base_url = f"http://{subject.ipaddr}:{subject.port}"
     agent_result = run_agent(
         base_url=agent_base_url,

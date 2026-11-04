@@ -47,6 +47,7 @@ def _task_to_dict(task: models.TaskList, db: Optional[Session] = None) -> dict:
         "depends": depends,
         "pre_script": task.pre_script,
         "input": input_data,
+        "timeout": task.timeout,
         "expect": task.expect,
         "clean": task.clean,
     }
@@ -99,7 +100,8 @@ def list_tasks_in_group(gid: int) -> str:
             return json.dumps({"error": f"任务组 {gid} 不存在"}, ensure_ascii=False)
         tasks = crud.list_tasks(db, gid=gid)
         return json.dumps([
-            {"tid": t.tid, "gid": t.gid, "name": t.name, "description": t.description}
+            {"tid": t.tid, "gid": t.gid, "name": t.name, "description": t.description,
+             "timeout": t.timeout}
             for t in tasks
         ], ensure_ascii=False, indent=2)
     finally:

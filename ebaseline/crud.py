@@ -89,6 +89,7 @@ def create_task(db: Session, gid: int, data: schemas.TaskCreate) -> models.TaskL
         depends=depends,
         pre_script=data.pre_script,
         input=input_str,
+        timeout=data.timeout,
         expect=data.expect,
         clean=data.clean,
     )
@@ -123,6 +124,9 @@ def update_task(db: Session, tid: int, data: schemas.TaskUpdate) -> models.TaskL
         task.pre_script = data.pre_script
     if data.input is not None:
         task.input = json.dumps(data.input, ensure_ascii=False)
+    # 显式传 null 时清除任务级超时，恢复全局默认
+    if "timeout" in data.model_fields_set:
+        task.timeout = data.timeout
     if data.expect is not None:
         task.expect = data.expect
     if data.clean is not None:

@@ -47,6 +47,7 @@ class TaskList(Base):
     depends: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)  # 逗号分隔的 tid
     pre_script: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     input: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON string
+    timeout: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Agent 调用超时（秒），NULL=全局默认
     expect: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     clean: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 

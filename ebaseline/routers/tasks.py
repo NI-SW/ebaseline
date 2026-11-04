@@ -32,6 +32,7 @@ def _task_to_response(task: models.TaskList) -> schemas.TaskResponse:
         depends=depends,
         pre_script=task.pre_script,
         input=input_data,
+        timeout=task.timeout,
         expect=task.expect,
         clean=task.clean,
     )

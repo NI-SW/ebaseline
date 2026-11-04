@@ -295,8 +295,9 @@ async function doLogin() {
     state.token = r.access_token;
     localStorage.setItem('eb_token', r.access_token);
     state.user = await api('/api/v1/auth/me');
-    state.page = 'groups';
-    render();
+    // 登录后恢复到 URL hash 指向的页面（刷新/会话过期重新登录时保持上下文）
+    if (location.hash && location.hash !== '#' && location.hash !== '#/') await loadRoute();
+    else navigate('groups', true);
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -316,7 +317,7 @@ function render() {
   <div class="layout">
     <div class="sidebar">
       <div class="logo">ebaseline<small>智能体基线测试系统</small></div>
-      <nav>${PAGES.map(([k, n]) => `<a class="${state.page === k ? 'active' : ''}" onclick="goto('${k}')">${n}</a>`).join('')}</nav>
+      <nav>${PAGES.map(([k, n]) => `<a class="${state.page === k || (k === 'groups' && state.page === 'tasks') ? 'active' : ''}" onclick="goto('${k}')">${n}</a>`).join('')}</nav>
     </div>
     <div class="main">
       <div class="topbar">
@@ -330,15 +331,57 @@ function render() {
 }
 
 function goto(p) {
-  state.page = p; state.detail = null;
+  navigate(p);
+}
+
+/* ═══════════════════════ 路由（URL hash，刷新/后退保持当前页面）═══════════════════════ */
+const TOP_PAGES = ['groups', 'subjects', 'batches', 'results'];
+
+// #/groups | #/subjects | #/batches | #/results
+// #/tasks/<gid> | #/workspace/<gid>
+// #/batch/<bid>（返回测试批次）| #/result/<bid>（返回执行结果）
+function parseRoute() {
+  const parts = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
+  const name = parts[0] || 'groups';
+  const id = /^\d+$/.test(parts[1] || '') ? Number(parts[1]) : null;
+  if (name === 'tasks' && id) return { page: 'tasks', id };
+  if (name === 'workspace' && id) return { page: 'workspace', id };
+  if (name === 'batch' && id) return { page: 'batches', id };
+  if (name === 'result' && id) return { page: 'results', id };
+  if (TOP_PAGES.includes(name)) return { page: name, id: null };
+  return { page: 'groups', id: null };
+}
+
+function navigate(path, replace = false) {
+  const hash = '#/' + path;
+  if (location.hash === hash) { loadRoute(); return; }
+  if (replace) { history.replaceState(null, '', hash); loadRoute(); }
+  else location.hash = hash;
+}
+
+async function loadRoute() {
+  if (!state.token) return renderLogin();
+  const r = parseRoute();
+  // 清理上一页面遗留的定时器 / 工作空间连接
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
-  if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; }
-  if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
+  if (state.page === 'workspace' && r.page !== 'workspace') closeWorkspace();
+  if (r.page === 'workspace' && _wsGid !== r.id) {
+    _wsGid = r.id; _wsGname = ''; _wsPath = ''; _wsFile = null; _wsDirty = false;
+    try {
+      const g = await api(`/api/v1/groups/${r.id}`);
+      _wsGname = g.name;
+    } catch (e) { toast(e.message, 'error'); navigate('groups', true); return; }
+  }
+  state.page = r.page;
+  state.detail = r.id;
   render();
 }
 
 async function loadPage() {
-  const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults }[state.page];
+  const { page, detail } = state;
+  if (page === 'tasks') return pageTasks(detail);
+  if ((page === 'batches' || page === 'results') && detail) return batchDetail(detail, page);
+  const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults }[page];
   if (fn) await fn();
 }
 
@@ -352,12 +395,12 @@ async function pageGroups() {
     <div class="flex-between"><h2>任务组列表</h2>${canEdit ? '<button class="btn" onclick="showGroupModal()">+ 新建任务组</button>' : ''}</div>
     <table><thead><tr><th>ID</th><th>名称</th><th>描述</th><th>Python</th><th>变量数</th><th>操作</th></tr></thead>
     <tbody>${groups.map(g => `<tr>
-      <td>${g.id}</td><td><a onclick="pageTasks(${g.id}, '${esc(g.name)}')">${esc(g.name)}</a></td>
+      <td>${g.id}</td><td><a onclick="navigate('tasks/${g.id}')">${esc(g.name)}</a></td>
       <td>${esc(g.description || '')}</td>
       <td><span class="tag tag-blue">${g.python_version || '3.11'}</span></td>
       <td>${g.variables ? Object.keys(g.variables).length : 0}</td>
       <td>
-        <button class="btn btn-sm btn-default" onclick="pageTasks(${g.id}, '${esc(g.name)}')">任务</button>
+        <button class="btn btn-sm btn-default" onclick="navigate('tasks/${g.id}')">任务</button>
         <button class="btn btn-sm" onclick="openWorkspace(${g.id}, '${esc(g.name)}')">工作空间</button>
         ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showGroupModal(${JSON.stringify(g)})'>编辑</button>
         <button class="btn btn-sm btn-danger" onclick="delGroup(${g.id})">删除</button>` : ''}
@@ -398,9 +441,10 @@ async function delGroup(gid) {
 
 /* ═══════════════════════ 任务列表 ═══════════════════════ */
 async function pageTasks(gid, gname) {
-  state.page = 'tasks';
-  $('#page-title').textContent = `任务组：${gname}`;
+  state.page = 'tasks'; state.detail = gid;
   const [tasks, group] = await Promise.all([api(`/api/v1/groups/${gid}/tasks`), api(`/api/v1/groups/${gid}`)]);
+  gname = group?.name || gname || `gid=${gid}`;
+  $('#page-title').textContent = `任务组：${gname}`;
   const canEdit = state.user.privilege >= 1;
   $('#content').innerHTML = `
   <div class="card">
@@ -411,18 +455,19 @@ async function pageTasks(gid, gname) {
         ${canEdit ? `<button class="btn" onclick="showTaskModal(${gid})">+ 新建任务</button>` : ''}
       </div>
     </div>
-    <table><thead><tr><th>TID</th><th>名称</th><th>依赖</th><th>前置脚本</th><th>校验脚本</th><th>清理脚本</th><th>操作</th></tr></thead>
+    <table><thead><tr><th>TID</th><th>名称</th><th>依赖</th><th>前置脚本</th><th>校验脚本</th><th>清理脚本</th><th>超时(秒)</th><th>操作</th></tr></thead>
     <tbody>${tasks.map(t => `<tr>
       <td class="mono">${t.tid}</td><td>${esc(t.name)}</td>
       <td class="mono">${(t.depends || []).join(', ') || '-'}</td>
       <td class="mono">${esc(t.pre_script || '-')}</td>
       <td class="mono">${esc(t.expect || '-')}</td>
       <td class="mono">${esc(t.clean || '-')}</td>
+      <td class="mono">${t.timeout != null ? t.timeout : '默认'}</td>
       <td>
         <button class="btn btn-sm btn-default" onclick='viewTask(${JSON.stringify(t)})'>详情</button>
         ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showTaskModal(${gid}, ${JSON.stringify(t)})'>编辑</button>
         <button class="btn btn-sm btn-danger" onclick="delTask(${t.tid}, ${gid}, '${esc(gname)}')">删除</button>` : ''}
-      </td></tr>`).join('') || '<tr><td colspan="7" class="empty">暂无任务</td></tr>'}
+      </td></tr>`).join('') || '<tr><td colspan="8" class="empty">暂无任务</td></tr>'}
     </tbody></table>
   </div>
   <div class="card"><h2>组变量</h2><div class="log-view">${esc(JSON.stringify(group.variables, null, 2) || '{}')}</div></div>`;
@@ -437,6 +482,7 @@ function viewTask(t) {
       <dt>前置脚本</dt><dd class="mono">${esc(t.pre_script || '-')}</dd>
       <dt>校验脚本</dt><dd class="mono">${esc(t.expect || '-')}</dd>
       <dt>清理脚本</dt><dd class="mono">${esc(t.clean || '-')}</dd>
+      <dt>Agent 超时</dt><dd>${t.timeout != null ? `${t.timeout} 秒` : '默认（全局配置）'}</dd>
     </dl>
     <div class="form-item" style="margin-top:16px"><label>输入（input）</label>
     <div class="log-view">${esc(JSON.stringify(t.input, null, 2) || '{}')}</div></div>
@@ -449,6 +495,7 @@ function showTaskModal(gid, t) {
     ${isEdit ? '' : '<div class="form-item"><label>TID（留空自动分配）</label><input id="t_tid" placeholder="自动"></div>'}
     <div class="form-item"><label>名称</label><input id="t_name" value="${esc(t?.name || '')}" maxlength="128"></div>
     <div class="form-item"><label>描述</label><input id="t_desc" value="${esc(t?.description || '')}" maxlength="128"></div>
+    <div class="form-item"><label>超时时间（秒，Agent 调用，留空使用全局默认）</label><input id="t_timeout" type="number" min="1" step="1" value="${t?.timeout ?? ''}" placeholder="默认"></div>
     <div class="form-item"><label>依赖（逗号分隔的 tid）</label><input id="t_deps" value="${(t?.depends || []).join(',')}" maxlength="256"></div>
     <div class="form-item"><label>前置脚本</label><input id="t_pre" value="${esc(t?.pre_script || '')}" placeholder="check_xxx.py --arg" maxlength="128"></div>
     <div class="form-item"><label>输入（JSON：{prompt, conversation?}）</label><textarea id="t_input" rows="6">${esc(t?.input ? JSON.stringify(t.input, null, 2) : '{"prompt": ""}')}</textarea></div>
@@ -458,11 +505,18 @@ function showTaskModal(gid, t) {
     let inputObj = null;
     const rawInput = $('#t_input').value.trim();
     if (rawInput) { try { inputObj = JSON.parse(rawInput); } catch { toast('input JSON 格式错误', 'error'); return false; } }
+    const timeoutRaw = $('#t_timeout').value.trim();
+    let timeoutVal = null;
+    if (timeoutRaw) {
+      timeoutVal = parseInt(timeoutRaw, 10);
+      if (isNaN(timeoutVal) || timeoutVal < 1) { toast('超时时间需为正整数秒', 'error'); return false; }
+    }
     const depsRaw = $('#t_deps').value.trim();
     const body = {
       name: $('#t_name').value, description: $('#t_desc').value,
       depends: depsRaw ? depsRaw.split(',').map(x => parseInt(x.trim())).filter(x => !isNaN(x)) : null,
       pre_script: $('#t_pre').value || null, input: inputObj,
+      timeout: timeoutVal,
       expect: $('#t_expect').value || null, clean: $('#t_clean').value || null,
     };
     if (isEdit) await api(`/api/v1/tasks/${t.tid}`, { method: 'PUT', body: JSON.stringify(body) });
@@ -551,7 +605,7 @@ async function pageBatches() {
         <td>${fmtSec(m.duration_avg)}</td>
         <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
         <td>
-          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id}, 'batches')">详情</button>
+          <button class="btn btn-sm btn-default" onclick="navigate('batch/${b.id}')">详情</button>
           ${b.status !== 1 ? `<button class="btn btn-sm btn-success" onclick="runBatch(${b.id})">执行</button>` :
             `<button class="btn btn-sm btn-danger" onclick="cancelBatch(${b.id})">取消</button>`}
           ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'batches')">删除</button>` : ''}
@@ -818,7 +872,7 @@ async function pageResults() {
         <td>${fmtNum(m.tool_calls_avg)}</td>
         <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
         <td>
-          <button class="btn btn-sm btn-default" onclick="batchDetail(${b.id}, 'results')">详情</button>
+          <button class="btn btn-sm btn-default" onclick="navigate('result/${b.id}')">详情</button>
           ${canEdit ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'results')">删除</button>` : ''}
         </td></tr>`;
     }).join('') || '<tr><td colspan="19" class="empty">暂无批次结果</td></tr>'}
@@ -832,7 +886,14 @@ let _wsTerm = null, _wsSocket = null, _wsFit = null;
 
 async function openWorkspace(gid, gname) {
   _wsGid = gid; _wsGname = gname; _wsPath = ''; _wsFile = null; _wsDirty = false;
-  state.page = 'workspace'; render();
+  navigate('workspace/' + gid);
+}
+
+function closeWorkspace() {
+  if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; }
+  if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
+  _wsFit = null;
+  _wsGid = null; _wsGname = ''; _wsPath = ''; _wsFile = null; _wsDirty = false;
 }
 
 async function renderWorkspaceFull() {
@@ -1047,12 +1108,16 @@ function showModal(title, bodyHtml, onOk) {
 }
 
 /* ═══════════════════════ 启动 ═══════════════════════ */
+window.addEventListener('hashchange', loadRoute);
+
 (async () => {
   if (state.token) {
     try { state.user = await api('/api/v1/auth/me'); }
     catch { state.token = null; }
   }
-  render();
+  if (!state.token) return renderLogin();
+  if (!location.hash) history.replaceState(null, '', '#/groups');
+  await loadRoute();
 })();
 </script>
 </body>

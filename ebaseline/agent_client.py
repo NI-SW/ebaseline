@@ -12,6 +12,7 @@ from typing import Optional
 
 import json
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -128,6 +129,31 @@ def _accumulate_usage(total: dict, usage: dict) -> None:
             total[k] = total.get(k, 0) + usage[k]
 
 
+def _abort_response(resp) -> None:
+    """从超时线程强制打断流式读取。
+
+    resp.close() 无法唤醒阻塞中的 iter_lines（缓冲区未填满时），
+    这里直接 shutdown 底层 socket，让读取立即返回。
+    """
+    socks = []
+    try:
+        socks.append(resp.raw._connection.sock)
+    except Exception:
+        pass
+    try:
+        socks.append(resp.raw._fp.fp.raw._sock)
+    except Exception:
+        pass
+    for sock in socks:
+        if sock is None:
+            continue
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+            return
+        except Exception:
+            continue
+
+
 def _run_agent_once(
     url: str,
     headers: dict,
@@ -153,6 +179,7 @@ def _run_agent_once(
     text_parts: list[str] = []
     first_delta_at: Optional[float] = None
     seen_tool_ids: set[str] = set()
+    resp_holder: dict = {}
 
     def _record_tool(item) -> None:
         """统计工具调用（同一 item 的 added/done 不重复计数）。"""
@@ -170,6 +197,10 @@ def _run_agent_once(
 
     def _on_timeout():
         result["error"] = "Agent 调用超时"
+        # 中止响应以打断阻塞中的 iter_lines（流式连接可能持续有小数据到达）
+        resp = resp_holder.get("resp")
+        if resp is not None:
+            _abort_response(resp)
 
     def _finalize():
         """确保 text 字段始终被设置。"""
@@ -186,8 +217,9 @@ def _run_agent_once(
             headers=headers,
             json=payload,
             stream=True,
-            timeout=(10, max(10, deadline - time.time())),
+            timeout=(10, max(1, deadline - time.time())),
         ) as resp:
+            resp_holder["resp"] = resp
             if resp.status_code != 200:
                 result["error"] = f"HTTP {resp.status_code}: {resp.text[:500]}"
                 return _finalize()
@@ -229,7 +261,8 @@ def _run_agent_once(
     except requests.exceptions.Timeout:
         result["error"] = "Agent 调用超时"
     except Exception as e:
-        result["error"] = f"Agent 调用异常: {e}"
+        if not result["error"]:
+            result["error"] = f"Agent 调用异常: {e}"
     finally:
         timer.cancel()
 

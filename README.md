@@ -115,6 +115,7 @@ ebaseline/
 | depends | 依赖任务 ID 列表（逗号分隔，仅组内） |
 | pre_script | 前置脚本路径（相对 scripts/ 目录） |
 | input | JSON：{prompt, conversation?} |
+| timeout | Agent 调用超时（秒），留空使用全局默认 `agent.default_timeout` |
 | expect | 期望校验脚本路径（返回码 0=成功） |
 | clean | 清理脚本路径（无论成败都会执行） |
 
@@ -197,6 +198,7 @@ ebaseline/
 2. 执行 pre_script（如果配置了）
 3. 渲染 prompt：替换 {VAR} 和 {VAR.SUBVAR} 占位符
 4. 调用 Agent API（OpenAI Responses API 格式，SSE 流式）
+   - 超时时间取 task_list.timeout，未配置时使用全局默认 agent.default_timeout
    - 自动附加自主执行指令（可在配置关闭）
    - 检测到请求确认时自动追问
    - 支持 conversation 多轮 QA 闭环
