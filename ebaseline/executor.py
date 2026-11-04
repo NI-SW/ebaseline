@@ -830,7 +830,10 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
         # 清除该批次的旧结果与运行上下文（重跑场景）
         crud.delete_results_by_batch(db, batch.id)
         runtime.reset_batch(batch.gid, batch.id)
-        runtime.prune_batches(batch.gid)
+        # 保留最近 20 个批次目录；同一组可能有其他批次在并行执行，不能删
+        with _running_lock:
+            running_ids = set(_running_batches)
+        runtime.prune_batches(batch.gid, protected=running_ids)
 
         total = len(sorted_tasks)
         success_count = 0

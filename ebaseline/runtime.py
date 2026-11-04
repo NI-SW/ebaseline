@@ -80,14 +80,40 @@ def purge_group(gid: int) -> None:
     shutil.rmtree(RUNTIME_ROOT / "ebase_runs" / f"group_{gid}", ignore_errors=True)
 
 
-def prune_batches(gid: int, keep: int = KEEP_BATCH_DIRS) -> None:
-    """按修改时间保留每组最近的 keep 个批次目录。"""
+def _last_activity(directory: Path) -> float:
+    """目录及其内文件的最新修改时间。
+
+    目录 mtime 只在增删文件时变化，任务执行中不断改写上下文文件时不会更新，
+    因此必须把文件 mtime 一并纳入，避免把正在执行的批次目录判定为“最旧”。
+    """
+    latest = directory.stat().st_mtime
+    try:
+        for p in directory.iterdir():
+            try:
+                latest = max(latest, p.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return latest
+
+
+def prune_batches(gid: int, keep: int = KEEP_BATCH_DIRS,
+                  protected: Optional[set[int]] = None) -> None:
+    """按最近活动时间保留每组最近的 keep 个批次目录。
+
+    protected 中的批次 id 不会删除（供执行器传入正在运行的批次）。
+    """
     group_root = RUNTIME_ROOT / "ebase_runs" / f"group_{gid}"
     if not group_root.is_dir():
         return
-    dirs = [d for d in group_root.iterdir() if d.is_dir() and d.name.startswith("batch_")]
+    protected_names = {f"batch_{bid}" for bid in (protected or ())}
+    dirs = [
+        d for d in group_root.iterdir()
+        if d.is_dir() and d.name.startswith("batch_") and d.name not in protected_names
+    ]
     if len(dirs) <= keep:
         return
-    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    dirs.sort(key=_last_activity, reverse=True)
     for d in dirs[keep:]:
         shutil.rmtree(d, ignore_errors=True)
