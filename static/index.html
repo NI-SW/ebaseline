@@ -191,6 +191,13 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// 把任意 JS 参数安全嵌入双引号 onclick 属性：
+// 先 JSON.stringify（处理引号/换行），再做 HTML 实体转义（处理属性边界）
+function jsArg(...args) {
+  return args.map(a => JSON.stringify(a)).join(', ')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 const BATCH_STATUS = { 0: ['未执行','tag-gray'], 1: ['执行中','tag-blue'], 2: ['已完成','tag-green'], 3: ['执行失败','tag-red'], 4: ['部分成功','tag-orange'] };
 const RESULT_TEXT = { 0: ['未执行','tag-gray'], 1: ['成功','tag-green'], 2: ['失败','tag-red'], 3: ['执行中','tag-blue'] };
 // 任务细分结果（从 process 中解析 result_detail）
@@ -401,8 +408,8 @@ async function pageGroups() {
       <td>${g.variables ? Object.keys(g.variables).length : 0}</td>
       <td>
         <button class="btn btn-sm btn-default" onclick="navigate('tasks/${g.id}')">任务</button>
-        <button class="btn btn-sm" onclick="openWorkspace(${g.id}, '${esc(g.name)}')">工作空间</button>
-        ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showGroupModal(${JSON.stringify(g)})'>编辑</button>
+        <button class="btn btn-sm" onclick="openWorkspace(${jsArg(g.id, g.name)})">工作空间</button>
+        ${canEdit ? `<button class="btn btn-sm btn-default" onclick="showGroupModal(${jsArg(g)})">编辑</button>
         <button class="btn btn-sm btn-danger" onclick="delGroup(${g.id})">删除</button>` : ''}
       </td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无任务组</td></tr>'}
     </tbody></table>
@@ -464,9 +471,9 @@ async function pageTasks(gid, gname) {
       <td class="mono">${esc(t.clean || '-')}</td>
       <td class="mono">${t.timeout != null ? t.timeout : '默认'}</td>
       <td>
-        <button class="btn btn-sm btn-default" onclick='viewTask(${JSON.stringify(t)})'>详情</button>
-        ${canEdit ? `<button class="btn btn-sm btn-default" onclick='showTaskModal(${gid}, ${JSON.stringify(t)})'>编辑</button>
-        <button class="btn btn-sm btn-danger" onclick="delTask(${t.tid}, ${gid}, '${esc(gname)}')">删除</button>` : ''}
+        <button class="btn btn-sm btn-default" onclick="viewTask(${jsArg(t)})">详情</button>
+        ${canEdit ? `<button class="btn btn-sm btn-default" onclick="showTaskModal(${jsArg(gid, t)})">编辑</button>
+        <button class="btn btn-sm btn-danger" onclick="delTask(${jsArg(t.tid, gid, gname)})">删除</button>` : ''}
       </td></tr>`).join('') || '<tr><td colspan="8" class="empty">暂无任务</td></tr>'}
     </tbody></table>
   </div>
@@ -547,7 +554,7 @@ async function pageSubjects() {
     <tbody>${subjects.map(s => `<tr>
       <td>${s.id}</td><td>${esc(s.name || '-')}</td><td class="mono">${esc(s.ipaddr)}</td><td class="mono">${s.port}</td>
       <td><span class="tag tag-blue">${s.api_mode === 0 ? 'OpenAI Responses' : '模式 ' + s.api_mode}</span></td>
-      <td>${canEdit ? `<button class="btn btn-sm btn-default" onclick='showSubjectModal(${JSON.stringify(s)})'>编辑</button>
+      <td>${canEdit ? `<button class="btn btn-sm btn-default" onclick="showSubjectModal(${jsArg(s)})">编辑</button>
       <button class="btn btn-sm btn-danger" onclick="delSubject(${s.id})">删除</button>` : ''}</td>
     </tr>`).join('') || '<tr><td colspan="6" class="empty">暂无待测主体</td></tr>'}
     </tbody></table>
@@ -592,7 +599,7 @@ async function pageBatches() {
   const groupMap = Object.fromEntries(groups.map(g => [g.id, g.name]));
   $('#content').innerHTML = `
   <div class="card">
-    <div class="flex-between"><h2>批次列表</h2><button class="btn" onclick='showBatchModal(${JSON.stringify(subjects)}, ${JSON.stringify(groups)})'>+ 创建批次</button></div>
+    <div class="flex-between"><h2>批次列表</h2><button class="btn" onclick="showBatchModal(${jsArg(subjects, groups)})">+ 创建批次</button></div>
     <div class="table-wrap"><table><thead><tr><th>ID</th><th>待测主体</th><th>任务组</th><th>状态</th><th>任务数</th><th>通过率</th><th>平均耗时</th><th>创建时间</th><th>操作</th></tr></thead>
     <tbody>${batches.map(b => {
       const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
@@ -694,10 +701,10 @@ async function batchDetail(bid, fromPage = 'batches') {
   <div class="card">
     <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span>${runningTid !== null ? '<span class="tag tag-blue">任务执行中</span>' : ''}</h2>
       <div class="flex">
-        <button class="btn btn-default" onclick="goto('${fromPage}')">返回</button>
-        <button class="btn btn-default" onclick="batchDetail(${bid}, '${fromPage}')">刷新</button>
+        <button class="btn btn-default" onclick="goto(${jsArg(fromPage)})">返回</button>
+        <button class="btn btn-default" onclick="batchDetail(${jsArg(bid, fromPage)})">刷新</button>
         <button class="btn btn-default" onclick="exportBatchCsv(${bid})">导出 CSV</button>
-        ${state.user.privilege >= 1 ? `<button class="btn btn-danger" onclick="delBatch(${bid}, '${fromPage}')">删除批次</button>` : ''}
+        ${state.user.privilege >= 1 ? `<button class="btn btn-danger" onclick="delBatch(${jsArg(bid, fromPage)})">删除批次</button>` : ''}
       </div></div>
     <dl class="detail-grid">
       <dt>批次 ID</dt><dd>${b.id}</dd>
@@ -1009,12 +1016,12 @@ async function wsLoadTree(path = '') {
   let html = '';
   if (r.path) {
     const parent = r.path.split('/').slice(0, -1).join('/');
-    html += `<div class="tree-item dir" onclick="wsLoadTree('${parent}')"><span class="icon">↩</span>..</div>`;
+    html += `<div class="tree-item dir" onclick="wsLoadTree(${jsArg(parent)})"><span class="icon">↩</span>..</div>`;
   }
   html += r.entries.map(e => {
     const icon = e.is_dir ? '📁' : (e.name.endsWith('.py') ? '🐍' : e.name.endsWith('.sh') ? '⚙️' : '📄');
     const size = e.is_dir ? '' : `<span class="size">${fmtSize(e.size)}</span>`;
-    const click = e.is_dir ? `wsLoadTree('${esc(e.path)}')` : `wsOpenFile('${esc(e.path)}')`;
+    const click = e.is_dir ? `wsLoadTree(${jsArg(e.path)})` : `wsOpenFile(${jsArg(e.path)})`;
     const active = _wsFile === e.path ? ' active' : '';
     return `<div class="tree-item${e.is_dir ? ' dir' : ''}${active}" onclick="${click}">
       <span class="icon">${icon}</span>${esc(e.name)}${size}</div>`;
