@@ -580,6 +580,8 @@ async function delSubject(sid) {
 
 /* ═══════════════════════ 批次 ═══════════════════════ */
 let _batchDetailTimer = null;
+let _batchDetailData = null;   // 当前批次详情（单任务执行时用于检查依赖）
+let _batchTaskStartedAt = 0;   // 单任务启动时间（等待后台写入“执行中”记录）
 
 async function pageBatches() {
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
@@ -631,12 +633,14 @@ function showBatchModal(subjects, groups) {
 }
 
 async function runBatch(bid) {
-  await api(`/api/v1/batches/${bid}/run`, { method: 'POST' });
+  try { await api(`/api/v1/batches/${bid}/run`, { method: 'POST' }); }
+  catch (e) { toast(e.message, 'error'); return; }
   toast('批次已启动'); setTimeout(pageBatches, 800);
 }
 
 async function cancelBatch(bid) {
-  await api(`/api/v1/batches/${bid}/cancel`, { method: 'POST' });
+  try { await api(`/api/v1/batches/${bid}/cancel`, { method: 'POST' }); }
+  catch (e) { toast(e.message, 'error'); return; }
   toast('已发送取消信号'); setTimeout(pageBatches, 800);
 }
 
@@ -648,15 +652,47 @@ async function delBatch(bid, fromPage = 'batches') {
   goto(fromPage === 'results' ? 'results' : 'batches');
 }
 
+/**
+ * 单独执行批次内的某个任务。
+ * 依赖未成功时提示用户确认，确认后忽略依赖强制执行。
+ */
+async function runBatchTask(tid) {
+  const b = _batchDetailData;
+  if (!b) return;
+  const tasks = b.tasks || [];
+  const task = tasks.find(t => t.tid === tid);
+  if (!task) return;
+  const byTid = Object.fromEntries(tasks.map(t => [t.tid, t]));
+  const unmet = (task.depends || []).filter(depTid => byTid[depTid]?.result !== 1);
+  let force = false;
+  if (unmet.length) {
+    const names = unmet.map(d => `#${d}${byTid[d] ? ' ' + byTid[d].name : ''}`).join('、');
+    if (!confirm(`任务 #${tid}（${task.name}）的依赖未满足：${names}\n\n是否忽略依赖强制执行？`)) return;
+    force = true;
+  }
+  try {
+    await api(`/api/v1/batches/${b.id}/tasks/${tid}/run${force ? '?force=true' : ''}`, { method: 'POST' });
+  } catch (e) { toast(e.message, 'error'); return; }
+  _batchTaskStartedAt = Date.now();
+  toast(force ? `任务 #${tid} 已启动（忽略依赖）` : `任务 #${tid} 已启动`);
+  // 等后台创建“执行中”记录后再刷新，随后由自动刷新接管
+  setTimeout(() => batchDetail(b.id, b._fromPage || 'batches'), 800);
+}
+
 async function batchDetail(bid, fromPage = 'batches') {
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
   const b = await api(`/api/v1/batches/${bid}`);
+  b._fromPage = fromPage;
+  _batchDetailData = b;
   const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
   const m = b.metrics || {};
+  const tasks = b.tasks || [];
+  const runningTid = b.running_task_tid ?? null;  // 服务端实时运行状态（丢弃重启前的残留）
+  const taskRunnable = b.status !== 1 && runningTid === null;
   $('#page-title').textContent = `批次 #${b.id} 详情`;
   $('#content').innerHTML = `
   <div class="card">
-    <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span></h2>
+    <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span>${runningTid !== null ? '<span class="tag tag-blue">任务执行中</span>' : ''}</h2>
       <div class="flex">
         <button class="btn btn-default" onclick="goto('${fromPage}')">返回</button>
         <button class="btn btn-default" onclick="batchDetail(${bid}, '${fromPage}')">刷新</button>
@@ -686,8 +722,8 @@ async function batchDetail(bid, fromPage = 'batches') {
   </div>
   <div class="card"><h2>任务执行结果</h2>
     <div class="table-wrap"><table>
-    <thead><tr><th>TID</th><th>任务</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
-    <tbody>${(b.tasks || []).map(t => {
+    <thead><tr><th>TID</th><th>任务</th><th>依赖</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
+    <tbody>${tasks.map(t => {
       const tm = t.metrics || {};
       const token = tm.tokens
         ? `${fmtTok(tm.tokens.input)} / ${fmtTok(tm.tokens.output)} / ${fmtTok(tm.tokens.total)}`
@@ -695,10 +731,17 @@ async function batchDetail(bid, fromPage = 'batches') {
       const toolTitle = esc((tm.tool_names || []).join(', '));
       const logBtn = t.result_id
         ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${t.result_id}, '任务 ${t.tid} 执行日志', ${t.result === 3})">${t.result === 3 ? '实时日志' : '查看日志'}</button>`
-        : '-';
+        : '';
+      const isLiveRunning = runningTid === t.tid;
+      const runBtn = isLiveRunning
+        ? '<button class="btn btn-sm btn-default" disabled style="opacity:.45;cursor:not-allowed">执行中</button>'
+        : taskRunnable
+          ? `<button class="btn btn-sm btn-success" onclick="runBatchTask(${t.tid})"${t.result === 3 ? ' title="上次执行未正常结束，可重新执行"' : ''}>执行</button>`
+          : '<button class="btn btn-sm btn-default" disabled style="opacity:.45;cursor:not-allowed" title="批次或其他任务正在执行">执行</button>';
       return `<tr>
         <td class="mono">${t.tid}</td>
         <td>${esc(t.name)}</td>
+        <td class="mono">${(t.depends || []).join(', ') || '-'}</td>
         <td>${resultTag(t)}</td>
         <td>${fmtSec(tm.duration_sec)}</td>
         <td>${fmtSec(tm.agent_duration_sec)}</td>
@@ -707,12 +750,14 @@ async function batchDetail(bid, fromPage = 'batches') {
         <td class="mono">${token}</td>
         <td>${fmtMs(tm.first_token_ms)}</td>
         <td class="mono">${t.create_time ? new Date(t.create_time).toLocaleString('zh-CN') : '-'}</td>
-        <td>${logBtn}</td></tr>`;
-    }).join('') || '<tr><td colspan="11" class="empty">暂无任务</td></tr>'}
+        <td><div class="flex" style="flex-wrap:nowrap;gap:6px">${logBtn}${runBtn}</div></td></tr>`;
+    }).join('') || '<tr><td colspan="12" class="empty">暂无任务</td></tr>'}
     </tbody></table></div>
   </div>`;
-  // 批次执行中时每 3 秒自动刷新
-  if (b.status === 1) {
+  if (runningTid !== null) _batchTaskStartedAt = 0;
+  // 批次执行中 / 有任务单独执行中 / 单任务刚启动（等待后台写入执行中记录）时每 3 秒自动刷新
+  const pendingTaskStart = _batchTaskStartedAt && Date.now() - _batchTaskStartedAt < 15000;
+  if (b.status === 1 || runningTid !== null || pendingTaskStart) {
     _batchDetailTimer = setInterval(() => {
       if ($('#page-title') && document.querySelector('.fullscreen-log') === null) {
         batchDetail(bid, fromPage);

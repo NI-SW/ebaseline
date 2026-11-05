@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from . import crud, executor, models
 from .database import _get_session_factory
 from .executor import render_variables
-from .metrics import result_summary
+from .metrics import latest_results_by_tid, result_summary
 
 mcp = FastMCP("ebaseline", stateless_http=True)
 
@@ -317,7 +317,7 @@ def export_batch_csv(batch_id: int) -> str:
         batch = crud.get_batch(db, batch_id)
         if batch is None:
             return json.dumps({"error": f"批次 {batch_id} 不存在"}, ensure_ascii=False)
-        results = crud.list_results(db, batch_id=batch_id)
+        results = latest_results_by_tid(crud.list_results(db, batch_id=batch_id))
         if not results:
             return json.dumps({"error": "批次无结果"}, ensure_ascii=False)
 

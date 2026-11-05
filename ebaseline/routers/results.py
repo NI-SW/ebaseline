@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .. import crud, models, schemas
 from ..auth import get_current_user, require_privilege
 from ..database import get_db
-from ..metrics import result_summary
+from ..metrics import latest_results_by_tid, result_summary
 
 router = APIRouter(prefix="/api/v1/results", tags=["results"])
 
@@ -55,6 +55,9 @@ def export_results(
 ):
     """导出结果为 CSV（可按批次过滤）。"""
     results = crud.list_results(db, sid=sid, gid=gid, batch_id=batch_id)
+    # 批次导出按任务取最新结果：单任务重跑会产生同 tid 的多条历史记录
+    if batch_id is not None:
+        results = latest_results_by_tid(results)
     if not results:
         raise HTTPException(status_code=404, detail="没有可导出的结果")
 

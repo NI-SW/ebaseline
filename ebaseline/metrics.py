@@ -163,6 +163,13 @@ def _dedupe_by_tid(results: Iterable) -> list:
     return list(by_tid.values())
 
 
+def latest_results_by_tid(results: Iterable) -> list:
+    """同一 tid 只保留 id 最大的一条（任务重跑时取最新），按 id 倒序。"""
+    unique = _dedupe_by_tid(results)
+    unique.sort(key=lambda r: getattr(r, "id", 0) or 0, reverse=True)
+    return unique
+
+
 def compute_batch_metrics(results: Iterable, task_count: Optional[int] = None) -> dict:
     """汇总一个批次的结果指标。"""
     unique = _dedupe_by_tid(results)

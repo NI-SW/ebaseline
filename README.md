@@ -89,7 +89,7 @@ ebaseline/
 │       ├── groups.py        # CRUD /groups
 │       ├── tasks.py         # CRUD /groups/{gid}/tasks, /tasks/{tid}
 │       ├── subjects.py      # CRUD /subjects
-│       ├── batches.py       # CRUD /batches + POST /batches/{id}/run
+│       ├── batches.py       # CRUD /batches + 批次/单任务执行
 │       └── results.py       # GET /results + GET /results/export
 ├── ebaseline_sdk.py         # 脚本侧 SDK（单文件、纯标准库，读运行上下文）
 ├── scripts/                 # 校验脚本
@@ -166,6 +166,7 @@ ebaseline/
 - `GET /api/v1/batches` - 列表
 - `GET /api/v1/batches/{id}` - 详情（含任务状态）
 - `POST /api/v1/batches/{id}/run` - 执行
+- `POST /api/v1/batches/{id}/tasks/{tid}/run` - 单独执行批次内任务（`?force=true` 忽略依赖）
 - `POST /api/v1/batches/{id}/cancel` - 取消
 - `DELETE /api/v1/batches/{id}` - 删除（需管理员）
 

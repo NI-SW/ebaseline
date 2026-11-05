@@ -32,6 +32,8 @@ from .metrics import result_verdict
 # 全局线程池：批次执行异步化
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ebexec")
 _running_batches: dict[int, threading.Event] = {}
+# 批次内单任务执行：(batch_id, tid) -> 取消事件
+_running_tasks: dict[tuple[int, int], threading.Event] = {}
 _running_lock = threading.Lock()
 
 
@@ -499,8 +501,12 @@ def _execute_single_task(
     group: models.TaskGroup,
     task: models.TaskList,
     cancel_event: threading.Event,
+    ignore_dependencies: bool = False,
 ) -> dict:
-    """执行单个任务，返回执行详情。"""
+    """执行单个任务，返回执行详情。
+
+    ignore_dependencies=True 时跳过依赖检查（批次详情页单独执行任务用）。
+    """
     cfg = get_config()
     start_time = time.time()
 
@@ -514,8 +520,12 @@ def _execute_single_task(
 
     # 1. 检查依赖
     logger.log("\n--- 阶段 1: 检查依赖 ---")
-    ok, reason = _check_dependencies(db, batch, task)
-    logger.log(f"依赖检查: {'通过' if ok else '失败: ' + reason}")
+    if ignore_dependencies:
+        ok, reason = True, ""
+        logger.log("依赖检查: 已跳过（单独执行，忽略依赖）")
+    else:
+        ok, reason = _check_dependencies(db, batch, task)
+        logger.log(f"依赖检查: {'通过' if ok else '失败: ' + reason}")
     if not ok:
         metrics = _base_metrics(start_time, stage="dependency", reason=reason)
         logger.finish(2, metrics=metrics)
@@ -879,10 +889,105 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
             _running_batches.pop(batch_id, None)
 
 
+def _recompute_batch_status(db: Session, batch_id: int) -> None:
+    """按批次内各任务的最新结果重算批次状态。
+
+    用于单独执行某个任务后同步批次状态（不删除其他任务的结果）。
+    """
+    batch = crud.get_batch(db, batch_id)
+    if batch is None:
+        return
+    tid_set = {t.tid for t in crud.list_tasks(db, gid=batch.gid)}
+    by_tid: dict[int, models.TaskResult] = {}
+    for r in crud.list_results(db, batch_id=batch_id):
+        if r.tid in tid_set:
+            by_tid.setdefault(r.tid, r)  # list_results 按 id 倒序，首条即最新
+
+    # 调用时机是单任务刚结束（同一批次不允许并发单任务），
+    # 因此残留的 result=3 视为未正常结束，不能当作成功。
+    if not by_tid:
+        status = 0  # 未执行
+    elif len(by_tid) >= len(tid_set) and all(r.result == 1 for r in by_tid.values()):
+        status = 2  # 全部任务成功
+    elif any(r.result == 1 for r in by_tid.values()):
+        status = 4  # 部分成功
+    else:
+        status = 3  # 执行失败
+    crud.update_batch_status(db, batch_id, status)
+
+
+def _run_task_sync(batch_id: int, tid: int, force: bool,
+                   cancel_event: threading.Event) -> None:
+    """同步执行批次内的单个任务（在线程池中运行）。"""
+    db = _get_session_factory()()
+    try:
+        batch = crud.get_batch(db, batch_id)
+        if batch is None:
+            return
+        subject = crud.get_subject(db, batch.sid)
+        group = crud.get_task_group(db, batch.gid)
+        task = crud.get_task(db, tid)
+        if subject is None or group is None or task is None or task.gid != batch.gid:
+            return
+        try:
+            _execute_single_task(db, batch, subject, group, task, cancel_event,
+                                 ignore_dependencies=force)
+        except Exception as e:
+            import traceback
+            err_log = f"执行异常: {e}\n" + traceback.format_exc()
+            crud.create_result(
+                db, sid=batch.sid, gid=batch.gid, tid=task.tid,
+                result=2, process=err_log,
+                batch_id=batch.id, result_detail=0,
+                metrics=json.dumps({"metrics_version": 2, "stage": "exception"}, ensure_ascii=False),
+            )
+        finally:
+            _recompute_batch_status(db, batch_id)
+    finally:
+        db.close()
+        with _running_lock:
+            _running_tasks.pop((batch_id, tid), None)
+
+
+def has_running_task(batch_id: int, tid: Optional[int] = None) -> bool:
+    """批次内是否有任务正在单独执行（指定 tid 时只查该任务）。"""
+    with _running_lock:
+        if tid is None:
+            return any(bid == batch_id for bid, _ in _running_tasks)
+        return (batch_id, tid) in _running_tasks
+
+
+def running_task_tid(batch_id: int) -> Optional[int]:
+    """批次内正在单独执行的任务 tid；没有则返回 None。"""
+    with _running_lock:
+        for bid, tid in _running_tasks:
+            if bid == batch_id:
+                return tid
+    return None
+
+
+def start_task_async(batch_id: int, tid: int, force: bool = False) -> bool:
+    """异步启动批次内的单个任务。返回是否成功启动。
+
+    同一批次同一时刻只允许一个单任务执行，避免共享工作空间冲突。
+    """
+    with _running_lock:
+        if batch_id in _running_batches:
+            return False
+        if any(bid == batch_id for bid, _ in _running_tasks):
+            return False
+        cancel_event = threading.Event()
+        _running_tasks[(batch_id, tid)] = cancel_event
+    _executor.submit(_run_task_sync, batch_id, tid, force, cancel_event)
+    return True
+
+
 def start_batch_async(batch_id: int) -> bool:
     """异步启动批次。返回是否成功启动（已在运行则返回 False）。"""
     with _running_lock:
         if batch_id in _running_batches:
+            return False
+        if any(bid == batch_id for bid, _ in _running_tasks):
             return False
         cancel_event = threading.Event()
         _running_batches[batch_id] = cancel_event
