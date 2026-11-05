@@ -157,6 +157,7 @@ class BatchDetailResponse(BatchResponse):
     subject_name: Optional[str] = None
     group_name: Optional[str] = None
     tasks: Optional[list[dict[str, Any]]] = None  # 包含每个任务的执行状态与指标
+    running_task_tid: Optional[int] = None  # 正在单独执行的任务 tid（服务端实时状态）
 
 
 # ── Result ─────────────────────────────────────────────────────

@@ -38,6 +38,13 @@ def _batch_metrics_map(db: Session, batches: list[models.TaskBatch]) -> dict[int
     }
 
 
+def _depends_list(depends_str: str | None) -> list[int]:
+    """把 task_list.depends（逗号分隔）解析为 tid 列表。"""
+    if not depends_str:
+        return []
+    return [int(x) for x in (p.strip() for p in depends_str.split(",")) if x.isdigit()]
+
+
 def _batch_dict(batch: models.TaskBatch, metrics: dict | None = None) -> dict:
     return {
         "id": batch.id,
@@ -103,6 +110,7 @@ def get_batch(
         task_details.append({
             "tid": task.tid,
             "name": task.name,
+            "depends": _depends_list(task.depends),
             "result": r.result if r else 0,
             "result_detail": r.result_detail if r else None,
             "verdict": summary["verdict"],
@@ -124,6 +132,7 @@ def get_batch(
         group_name=group.name if group else None,
         metrics=compute_batch_metrics(results, task_count=len(tasks)),
         tasks=task_details,
+        running_task_tid=executor.running_task_tid(batch.id),
     )
 
 
@@ -139,9 +148,45 @@ def run_batch(
         raise HTTPException(status_code=404, detail="批次不存在")
     if batch.status == 1:
         raise HTTPException(status_code=409, detail="批次正在执行中")
+    if executor.has_running_task(batch_id):
+        raise HTTPException(status_code=409, detail="该批次有任务正在单独执行，请等待完成")
     if not executor.start_batch_async(batch_id):
         raise HTTPException(status_code=409, detail="批次已在执行队列中")
     return {"batch_id": batch_id, "status": 1, "message": "批次已启动"}
+
+
+@router.post("/{batch_id}/tasks/{tid}/run")
+def run_batch_task(
+    batch_id: int,
+    tid: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(get_current_user),
+):
+    """异步执行批次内的单个任务。
+
+    force=true 时忽略依赖检查（用于单独调试某个任务）。
+    """
+    batch = crud.get_batch(db, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    if batch.status == 1 or executor.is_batch_running(batch_id):
+        raise HTTPException(status_code=409, detail="批次正在执行中")
+    if crud.get_subject(db, batch.sid) is None:
+        raise HTTPException(status_code=404, detail="批次关联的待测主体不存在")
+    task = crud.get_task(db, tid)
+    if task is None or task.gid != batch.gid:
+        raise HTTPException(status_code=404, detail=f"任务 {tid} 不存在或不属于该批次任务组")
+    if executor.has_running_task(batch_id):
+        raise HTTPException(status_code=409, detail="该批次有其他任务正在执行，请等待完成")
+    if not executor.start_task_async(batch_id, tid, force):
+        raise HTTPException(status_code=409, detail="任务已在执行队列中")
+    return {
+        "batch_id": batch_id,
+        "tid": tid,
+        "force": force,
+        "message": "任务已启动",
+    }
 
 
 @router.post("/{batch_id}/cancel")
