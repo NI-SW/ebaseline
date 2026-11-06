@@ -79,6 +79,27 @@ input:focus, textarea:focus { border-color: #1890ff; outline: none; }
 .metric .label { font-size: 12px; color: #999; }
 .metric .value { font-size: 20px; font-weight: 600; margin-top: 4px; color: #262626; }
 .metric .sub { font-size: 11px; color: #999; margin-top: 2px; }
+.page-sub { font-size: 12px; font-weight: 400; color: #999; margin-left: 8px; }
+/* ── 批次按任务组折叠 ── */
+.batch-group { background: #fff; border: 1px solid transparent; border-radius: 8px; box-shadow: 0 1px 2px #0001; margin-bottom: 14px; overflow: hidden; }
+.batch-group.open { border-color: #e6f4ff; }
+.batch-group-head { padding: 14px 18px 12px; cursor: pointer; user-select: none; }
+.batch-group-head:hover { background: #fafcff; }
+.batch-group-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.batch-group-title .chevron { width: 12px; flex-shrink: 0; color: #8c8c8c; font-size: 11px; transition: transform .18s ease; }
+.batch-group.open .batch-group-title .chevron { transform: rotate(90deg); }
+.batch-group-title .name { font-size: 16px; font-weight: 600; color: #262626; }
+.batch-group-title .gid { font-family: Consolas, monospace; font-size: 12px; color: #bfbfbf; }
+.batch-group-title .latest { margin-left: auto; color: #999; font-size: 12px; white-space: nowrap; }
+.batch-group-metrics { display: flex; flex-wrap: wrap; gap: 8px 26px; margin-top: 12px; padding-left: 22px; }
+.bg-metric .label { color: #999; font-size: 11px; white-space: nowrap; }
+.bg-metric .value { margin-top: 1px; color: #262626; font-size: 16px; font-weight: 600; white-space: nowrap; }
+.bg-metric .value.good { color: #52c41a; }
+.bg-metric .value.warn { color: #fa8c16; }
+.bg-metric .value.bad { color: #ff4d4f; }
+.bg-metric .sub { margin-top: 1px; color: #c0c0c0; font-size: 10px; white-space: nowrap; }
+.batch-group-body { border-top: 1px solid #f0f0f0; padding: 4px 18px 12px; }
+.batch-group-body table th { background: #fafafa; }
 .table-wrap { overflow-x: auto; }
 .flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .flex-between { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -589,6 +610,195 @@ async function delSubject(sid) {
 let _batchDetailTimer = null;
 let _batchDetailData = null;   // 当前批次详情（单任务执行时用于检查依赖）
 let _batchTaskStartedAt = 0;   // 单任务启动时间（等待后台写入“执行中”记录）
+let _batchGroupGids = [];      // 当前批次页的任务组 gid（全部展开/折叠用）
+const _batchGroupOpen = new Set();  // 展开的任务组 gid（跨列表刷新保留）
+
+function _metricNum(b, key) {
+  const v = b?.metrics?.[key];
+  return (v === null || v === undefined || isNaN(v)) ? null : Number(v);
+}
+
+function _sumMetric(items, key) {
+  return items.reduce((acc, b) => acc + (_metricNum(b, key) || 0), 0);
+}
+
+/** 按各批次的样本数加权求均值（批次 API 只提供均值+样本数，无法直接合并原始值）。 */
+function _weightedMetric(items, valueKey, sampleKey) {
+  let total = 0, samples = 0;
+  for (const b of items) {
+    const value = _metricNum(b, valueKey);
+    const weight = _metricNum(b, sampleKey) || 0;
+    if (value === null || weight <= 0) continue;
+    total += value * weight;
+    samples += weight;
+  }
+  return { value: samples ? total / samples : null, samples };
+}
+
+function _rateClass(v) {
+  if (v === null || v === undefined || isNaN(v)) return '';
+  return v >= 0.8 ? 'good' : v >= 0.5 ? 'warn' : 'bad';
+}
+
+function _bgMetric(label, value, sub = '', title = '', cls = '') {
+  return `<div class="bg-metric"${title ? ` title="${esc(title)}"` : ''}>
+    <div class="label">${label}</div>
+    <div class="value${cls ? ' ' + cls : ''}">${value}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ''}
+  </div>`;
+}
+
+/** 汇总同一任务组下所有批次的指标。通过率按结果条数累计，耗时/Token 等按样本数加权。 */
+function aggregateBatchGroup(items) {
+  const pass = _sumMetric(items, 'pass');
+  const partial = _sumMetric(items, 'partial');
+  const fail = _sumMetric(items, 'fail');
+  const executed = pass + partial + fail;
+
+  const durations = _weightedMetric(items, 'duration_avg', 'duration_samples');
+  const agentDurations = _weightedMetric(items, 'agent_duration_avg', 'agent_duration_samples');
+  const rounds = _weightedMetric(items, 'rounds_avg', 'rounds_samples');
+  const tools = _weightedMetric(items, 'tool_calls_avg', 'tool_call_samples');
+  const tokens = _weightedMetric(items, 'tokens_avg', 'token_samples');
+
+  const p95s = items.map(b => _metricNum(b, 'duration_p95')).filter(v => v !== null);
+  const tokenTotals = items.map(b => _metricNum(b, 'tokens_total')).filter(v => v !== null);
+  const statusCounts = {};
+  for (const b of items) statusCounts[b.status] = (statusCounts[b.status] || 0) + 1;
+
+  return {
+    count: items.length,
+    subjectCount: new Set(items.map(b => b.sid)).size,
+    taskCount: Math.max(0, ...items.map(b => _metricNum(b, 'task_count') || 0)),
+    pass, partial, fail, executed,
+    strictRate: (pass + fail) ? pass / (pass + fail) : null,
+    passRate: executed ? pass / executed : null,
+    durations, agentDurations, rounds, tools, tokens,
+    p95: p95s.length ? Math.max(...p95s) : null,
+    tokensTotal: tokenTotals.length ? tokenTotals.reduce((a, v) => a + v, 0) : null,
+    statusCounts,
+    latest: Math.max(0, ...items.map(b => {
+      const t = new Date(b.create_time).getTime();
+      return isNaN(t) ? 0 : t;
+    })),
+  };
+}
+
+function toggleBatchGroup(gid) {
+  const open = !_batchGroupOpen.has(gid);
+  if (open) _batchGroupOpen.add(gid); else _batchGroupOpen.delete(gid);
+  const el = document.getElementById(`batch-group-${gid}`);
+  if (!el) return;
+  el.classList.toggle('open', open);
+  const head = el.querySelector('.batch-group-head');
+  if (head) head.setAttribute('aria-expanded', String(open));
+  const body = el.querySelector('.batch-group-body');
+  if (body) body.style.display = open ? '' : 'none';
+}
+
+function expandAllBatchGroups(open) {
+  for (const gid of _batchGroupGids) {
+    if (open) _batchGroupOpen.add(gid); else _batchGroupOpen.delete(gid);
+    const el = document.getElementById(`batch-group-${gid}`);
+    if (!el) continue;
+    el.classList.toggle('open', open);
+    const head = el.querySelector('.batch-group-head');
+    if (head) head.setAttribute('aria-expanded', String(open));
+    const body = el.querySelector('.batch-group-body');
+    if (body) body.style.display = open ? '' : 'none';
+  }
+}
+
+function _batchGroupHtml(group, subjMap) {
+  const open = _batchGroupOpen.has(group.gid);
+  const agg = group.agg;
+  const statusTags = [0, 1, 2, 3, 4]
+    .filter(st => agg.statusCounts[st])
+    .map(st => {
+      const [txt, cls] = BATCH_STATUS[st] || ['未知', 'tag-gray'];
+      return `<span class="tag ${cls}">${txt} ${agg.statusCounts[st]}</span>`;
+    }).join('');
+  const metrics = [
+    _bgMetric('平均通过率', fmtPct(agg.strictRate),
+      agg.pass + agg.fail ? `严格口径 · ${fmtInt(agg.pass + agg.fail)} 个结果` : '暂无有效结果',
+      'PASS / (PASS + FAIL)，累计组内所有批次的执行结果', _rateClass(agg.strictRate)),
+    _bgMetric('含 PARTIAL 通过率', fmtPct(agg.passRate),
+      agg.executed ? `计入部分通过 · ${fmtInt(agg.executed)} 个结果` : '暂无已执行结果',
+      'PASS / (PASS + PARTIAL + FAIL)，把 PARTIAL（校验通过但 Agent 异常）计入分母'),
+    _bgMetric('平均耗时', fmtSec(agg.durations.value),
+      agg.durations.samples ? `${fmtInt(agg.durations.samples)} 个任务样本` : '暂无样本',
+      '各批次平均耗时按任务样本数加权'),
+    _bgMetric('P95 耗时', fmtSec(agg.p95),
+      agg.p95 === null ? '暂无样本' : '取组内批次最大值',
+      '各批次 P95 的最大值，用于观察最慢批次的尾部耗时'),
+    _bgMetric('平均 Agent 耗时', fmtSec(agg.agentDurations.value),
+      agg.agentDurations.samples ? `${fmtInt(agg.agentDurations.samples)} 个样本` : '暂无样本',
+      '各批次平均 Agent 耗时按样本数加权'),
+    _bgMetric('平均模型往返', fmtNum(agg.rounds.value),
+      agg.rounds.samples ? `${fmtInt(agg.rounds.samples)} 个样本` : '暂无样本',
+      '各批次平均模型往返次数按样本数加权'),
+    _bgMetric('平均工具调用', fmtNum(agg.tools.value),
+      agg.tools.samples ? `${fmtInt(agg.tools.samples)} 个样本` : '暂无样本',
+      '各批次平均工具调用次数按样本数加权'),
+    _bgMetric('平均 Token', fmtTok(agg.tokens.value),
+      agg.tokens.samples ? `${fmtInt(agg.tokens.samples)} 个有效样本` : '暂无样本',
+      '各批次平均 Token 按有效样本数加权，缺失不计入'),
+    _bgMetric('Token 总量', fmtTok(agg.tokensTotal), '组内所有批次合计',
+      '组内所有批次 tokens_total 之和'),
+  ].join('');
+
+  return `<div class="batch-group${open ? ' open' : ''}" id="batch-group-${group.gid}" data-gid="${group.gid}">
+    <div class="batch-group-head" role="button" tabindex="0" aria-expanded="${open}"
+      onclick="toggleBatchGroup(${group.gid})"
+      onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleBatchGroup(${group.gid});}">
+      <div class="batch-group-title">
+        <span class="chevron">▶</span>
+        <span class="name">${esc(group.name)}</span>
+        <span class="gid">gid=${group.gid}</span>
+        <span class="tag tag-blue">${agg.count} 个批次</span>
+        <span class="tag tag-gray">${agg.subjectCount} 个主体</span>
+        <span class="tag tag-gray">${agg.taskCount} 个任务/批</span>
+        ${statusTags}
+        <span class="latest">最近批次：${agg.latest ? new Date(agg.latest).toLocaleString('zh-CN') : '-'}</span>
+      </div>
+      <div class="batch-group-metrics">${metrics}</div>
+    </div>
+    <div class="batch-group-body"${open ? '' : ' style="display:none"'}>
+      <div class="table-wrap"><table>
+        <thead><tr><th>ID</th><th>待测主体</th><th>状态</th><th>任务数</th><th>通过/部分/失败/跳过</th><th>严格通过率</th><th>含 PARTIAL</th><th>平均耗时</th><th>P95 耗时</th><th>平均 Token</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody>${group.items.map(b => {
+          const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
+          const m = b.metrics || {};
+          return `<tr>
+            <td class="mono">#${b.id}</td>
+            <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
+            <td><span class="tag ${cls}">${txt}</span></td>
+            <td>${fmtInt(m.task_count)}</td>
+            <td title="通过 / 部分 / 失败 / 跳过">
+              <div class="flex" style="flex-wrap:nowrap;gap:4px">
+                <span class="tag tag-green">${fmtInt(m.pass)}</span>
+                <span class="tag tag-orange">${fmtInt(m.partial)}</span>
+                <span class="tag tag-red">${fmtInt(m.fail)}</span>
+                <span class="tag tag-gray">${fmtInt(m.skip)}</span>
+              </div>
+            </td>
+            <td>${fmtPct(m.strict_pass_rate)}</td>
+            <td>${fmtPct(m.pass_rate)}</td>
+            <td>${fmtSec(m.duration_avg)}</td>
+            <td>${fmtSec(m.duration_p95)}</td>
+            <td>${fmtTok(m.tokens_avg)}</td>
+            <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
+            <td><div class="flex" style="flex-wrap:nowrap;gap:6px">
+              <button class="btn btn-sm btn-default" onclick="navigate('batch/${b.id}')">详情</button>
+              ${b.status !== 1 ? `<button class="btn btn-sm btn-success" onclick="runBatch(${b.id})">执行</button>` :
+                `<button class="btn btn-sm btn-danger" onclick="cancelBatch(${b.id})">取消</button>`}
+              ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'batches')">删除</button>` : ''}
+            </div></td></tr>`;
+        }).join('')}
+        </tbody></table></div>
+    </div>
+  </div>`;
+}
 
 async function pageBatches() {
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
@@ -597,30 +807,36 @@ async function pageBatches() {
     api('/api/v1/batches'), api('/api/v1/subjects'), api('/api/v1/groups')]);
   const subjMap = Object.fromEntries(subjects.map(s => [s.id, `${s.name || s.ipaddr + ':' + s.port}`]));
   const groupMap = Object.fromEntries(groups.map(g => [g.id, g.name]));
+
+  // 按任务组归并；组内批次按 id 倒序，组间按最近批次时间倒序
+  const buckets = new Map();
+  for (const b of batches) {
+    if (!buckets.has(b.gid)) buckets.set(b.gid, []);
+    buckets.get(b.gid).push(b);
+  }
+  const groupList = [...buckets.entries()].map(([gid, items]) => {
+    items.sort((a, b) => b.id - a.id);
+    return {
+      gid,
+      name: groupMap[gid] || `gid=${gid}`,
+      items,
+      agg: aggregateBatchGroup(items),
+    };
+  }).sort((a, b) => b.agg.latest - a.agg.latest);
+  _batchGroupGids = groupList.map(g => g.gid);
+
   $('#content').innerHTML = `
   <div class="card">
-    <div class="flex-between"><h2>批次列表</h2><button class="btn" onclick="showBatchModal(${jsArg(subjects, groups)})">+ 创建批次</button></div>
-    <div class="table-wrap"><table><thead><tr><th>ID</th><th>待测主体</th><th>任务组</th><th>状态</th><th>任务数</th><th>通过率</th><th>平均耗时</th><th>创建时间</th><th>操作</th></tr></thead>
-    <tbody>${batches.map(b => {
-      const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
-      const m = b.metrics || {};
-      return `<tr>
-        <td>${b.id}</td>
-        <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
-        <td>${esc(groupMap[b.gid] || `gid=${b.gid}`)}</td>
-        <td><span class="tag ${cls}">${txt}</span></td>
-        <td>${fmtInt(m.task_count)}</td>
-        <td>${fmtPct(m.strict_pass_rate)}</td>
-        <td>${fmtSec(m.duration_avg)}</td>
-        <td class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</td>
-        <td>
-          <button class="btn btn-sm btn-default" onclick="navigate('batch/${b.id}')">详情</button>
-          ${b.status !== 1 ? `<button class="btn btn-sm btn-success" onclick="runBatch(${b.id})">执行</button>` :
-            `<button class="btn btn-sm btn-danger" onclick="cancelBatch(${b.id})">取消</button>`}
-          ${state.user.privilege >= 1 ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'batches')">删除</button>` : ''}
-        </td></tr>`;
-    }).join('') || '<tr><td colspan="9" class="empty">暂无批次</td></tr>'}
-    </tbody></table></div>
+    <div class="flex-between">
+      <h2>批次列表 <span class="page-sub">${groupList.length} 个任务组 · ${batches.length} 个批次</span></h2>
+      <div class="flex">
+        <button class="btn btn-default btn-sm" onclick="expandAllBatchGroups(true)">全部展开</button>
+        <button class="btn btn-default btn-sm" onclick="expandAllBatchGroups(false)">全部折叠</button>
+        <button class="btn" onclick="showBatchModal(${jsArg(subjects, groups)})">+ 创建批次</button>
+      </div>
+    </div>
+    ${groupList.map(g => _batchGroupHtml(g, subjMap)).join('') ||
+      '<div style="text-align:center;color:#999;padding:40px 0">暂无批次</div>'}
   </div>`;
 }
 
