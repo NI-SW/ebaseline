@@ -31,7 +31,7 @@ ebaseline/
   agent_client.py        # Agent /v1/responses SSE 流式调用（自动追问 + QA 闭环）
   executor.py            # 任务执行引擎（依赖拓扑排序 → pre_script → Agent → expect → clean）
   runtime.py             # 运行上下文快照（runtime/ebase_runs/...，供脚本 SDK 读取）
-  mcp_server.py          # MCP 服务（FastMCP streamable HTTP，12 个工具）
+  mcp_server.py          # MCP 服务（FastMCP streamable HTTP，36 个工具）
   routers/               # REST API 路由
     auth.py users.py groups.py tasks.py subjects.py batches.py results.py workspace.py
 ebaseline_sdk.py         # 脚本侧 SDK（单文件、纯标准库；读运行上下文，无需安装）
@@ -86,7 +86,15 @@ workspaces/group_<gid>/  # 组级工作空间（独立 venv + 脚本 + 文件）
 
 ### MCP 工具
 
-`list_task_groups`, `get_task_group`, `list_tasks_in_group`, `get_task_detail`, `render_task_prompt`, `list_subjects`, `create_batch`, `start_batch`, `get_batch_status`, `get_task_results`, `submit_task_result`, `export_batch_csv`
+任务组/任务：`list_task_groups`, `get_task_group`, `create_task_group`, `update_task_group`, `delete_task_group`, `list_tasks_in_group`, `get_task_detail`, `render_task_prompt`, `create_task`, `update_task`, `delete_task`
+
+待测主体：`list_subjects`, `get_subject`, `create_subject`, `update_subject`, `delete_subject`
+
+批次/结果：`create_batch`, `list_batches`, `start_batch`, `get_batch_status`, `get_batch_detail`, `run_batch_task`, `cancel_batch`, `delete_batch`, `get_task_results`, `submit_task_result`, `export_batch_csv`, `list_results`, `get_result`, `delete_results`, `export_results_csv`
+
+工作空间：`list_workspace_files`, `read_workspace_file`, `write_workspace_file`, `make_workspace_dir`, `delete_workspace_path`
+
+认证/用户管理和 WebSocket 终端不暴露为 MCP 工具（前者缺少请求级用户上下文，后者依赖长连接）。
 
 ## 数据库
 
