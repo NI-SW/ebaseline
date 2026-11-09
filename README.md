@@ -176,22 +176,65 @@ ebaseline/
 
 ## MCP 工具
 
-智能体可通过 MCP 客户端连接 `http://<host>:8081/mcp` 使用以下工具：
+智能体可通过 MCP 客户端连接 `http://<host>:8081/mcp` 使用以下工具（共 36 个）：
+
+### 任务组与任务
 
 | 工具 | 说明 |
 |------|------|
 | `list_task_groups` | 列出所有任务组 |
-| `get_task_group` | 获取任务组详情（含变量） |
+| `get_task_group` | 获取任务组详情（含变量、Python 版本） |
+| `create_task_group` | 创建任务组 |
+| `update_task_group` | 更新任务组 |
+| `delete_task_group` | 删除任务组（级联清理任务/批次/结果/工作空间） |
 | `list_tasks_in_group` | 列出组内任务 |
 | `get_task_detail` | 获取任务完整定义 |
 | `render_task_prompt` | 用组变量渲染 prompt |
+| `create_task` | 创建任务 |
+| `update_task` | 更新任务 |
+| `delete_task` | 删除任务 |
+
+### 待测主体
+
+| 工具 | 说明 |
+|------|------|
 | `list_subjects` | 列出待测 agent |
+| `get_subject` | 获取待测 agent 详情 |
+| `create_subject` | 注册待测 agent |
+| `update_subject` | 更新待测 agent |
+| `delete_subject` | 删除待测 agent |
+
+### 批次与结果
+
+| 工具 | 说明 |
+|------|------|
 | `create_batch` | 创建批次 |
-| `start_batch` | 启动批次执行 |
+| `list_batches` | 列出批次（含聚合指标） |
+| `start_batch` | 启动整批执行 |
 | `get_batch_status` | 查询批次状态 |
+| `get_batch_detail` | 批次详情（指标 + 每任务结果） |
+| `run_batch_task` | 单独执行批次内任务（`force` 忽略依赖） |
+| `cancel_batch` | 取消正在执行的批次 |
+| `delete_batch` | 删除批次 |
 | `get_task_results` | 查询批次任务结果 |
 | `submit_task_result` | 智能体主动上报结果 |
 | `export_batch_csv` | 导出批次结果 CSV |
+| `list_results` | 按 sid/gid/tid/result/batch_id 查询结果 |
+| `get_result` | 获取单条结果详情（完整日志） |
+| `delete_results` | 批量删除结果 |
+| `export_results_csv` | 按条件导出结果 CSV |
+
+### 工作空间
+
+| 工具 | 说明 |
+|------|------|
+| `list_workspace_files` | 列出工作空间目录 |
+| `read_workspace_file` | 读取文件内容 |
+| `write_workspace_file` | 写入文件 |
+| `make_workspace_dir` | 创建目录 |
+| `delete_workspace_path` | 删除文件/目录 |
+
+> 认证与用户管理、WebSocket 终端依赖请求级用户上下文或长连接，仅通过 REST/Web 控制台提供，不暴露为 MCP 工具。
 
 ## 任务执行流程
 
