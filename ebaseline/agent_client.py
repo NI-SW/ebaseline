@@ -28,6 +28,17 @@ AUTONOMY_DIRECTIVE = (
     "遇到不确定的参数请根据上下文合理推断并继续执行。"
 )
 
+# QA 闭环（任务配置了 conversation）专用：与 AUTONOMY_DIRECTIVE 互斥。
+# 不施加该指令时，Agent 会按自己的技能约定“代取缺失参数”，导致
+# 「缺失字段-应索取」用例从未真正触发提问（qa_record.asked_rounds 恒为 0）。
+_QA_MODE_DIRECTIVE = (
+    "【系统指令】这是一次多轮问答测试：用户故意遗漏了部分必要参数。"
+    "开始执行前先检查完成操作所需的参数是否齐全；只要缺少任何必需参数，"
+    "就必须先在回复正文中直接向用户提问索取，一次列出全部缺失项，"
+    "不要自行推断、代取或编造，也不要调用交互式提问工具。"
+    "收到用户补充后再继续执行。"
+)
+
 _FOLLOW_UP_INSTRUCTION = (
     "无需确认，请根据你已掌握的信息继续执行剩余操作，"
     "并在完成时给出明确的成功或失败结论。\n\n原始任务："
@@ -74,21 +85,40 @@ def _asks_for_confirmation(text: str) -> bool:
 
 
 def _asks_qa_question(text: str) -> bool:
-    """检测 Agent 是否在索取缺失字段。"""
+    """检测 Agent 是否在索取缺失字段。
+
+    QA 模式下 Agent 可能用「请提供」「请告知」「缺少」「未提供」等中文表述提问，
+    也可能直接问「节点名称是什么？」。这里覆盖常见问法，避免漏判后不喂答。
+    """
     if not text:
         return False
     patterns = [
-        r"请提供",
-        r"缺少.*信息",
-        r"需要.*参数",
-        r"没有.*字段",
-        r"请补充",
-        r"请告诉我",
+        r"请(提供|补充|告诉我|告知|说明)",
+        r"请问",
+        r"(缺少|缺失|未提供|未指定).{0,60}(请|麻烦|需要|能否|可否|[？?])",
+        r"(缺少|缺失|未提供|未指定).{0,60}无法(继续|执行|创建)",
+        r"没有.{0,20}(字段|信息|参数).{0,40}(请|[？?])",
+        r"需要.{0,20}(提供|补充|确认|参数|信息)",
+        r"(节点名|节点名称|名称|库名|数据库名|端口|用户名|密码|机器节点|工作节点)"
+        r".{0,20}(是什么|是多少|是哪个|请|[？?])",
+        r"(是什么|是多少|是哪个)[？?]",
     ]
     for p in patterns:
         if re.search(p, text):
             return True
     return False
+
+
+# 常见字段的中英文同义词：conversation 未显式配置 synonyms 时用于识别提问内容。
+_FIELD_SYNONYMS: dict[str, list[str]] = {
+    "node_name": ["节点名称", "节点名", "数据库节点名称", "数据库节点名", "名称", "db_name", "name"],
+    "database": ["默认数据库", "默认库", "数据库名称", "库名", "database", "default_db"],
+    "username": ["用户名", "账号", "用户", "username", "user"],
+    "password": ["密码", "口令", "password", "passwd", "pwd"],
+    "port": ["端口", "port"],
+    "machine_node": ["机器节点", "工作节点", "节点", "machine_node", "node_name"],
+    "ip": ["IP地址", "IP", "ip"],
+}
 
 
 def _detect_qa_fields(text: str, pending: list[dict]) -> list[str]:
@@ -99,9 +129,10 @@ def _detect_qa_fields(text: str, pending: list[dict]) -> list[str]:
     detected = []
     for item in pending:
         field_name = item["field"]
-        synonyms = item.get("synonyms", [field_name])
+        synonyms = item.get("synonyms") or (
+            [field_name] + _FIELD_SYNONYMS.get(field_name, []))
         for syn in synonyms:
-            if syn.lower() in text_lower:
+            if syn and syn.lower() in text_lower:
                 detected.append(field_name)
                 break
     return detected
@@ -309,6 +340,9 @@ def run_agent(
         "execute": True,
         "stream": True,
     }
+    if qa_mode:
+        # 作为系统级指令下发，优先于 Agent 技能里“缺参可代取”的约定。
+        payload["instructions"] = _QA_MODE_DIRECTIVE
 
     start_time = time.time()
     deadline = start_time + timeout
@@ -414,6 +448,7 @@ def run_agent(
                     "execute": True,
                     "stream": True,
                     "previous_response_id": response_id,
+                    "instructions": _QA_MODE_DIRECTIVE,
                 }
                 continue
 
