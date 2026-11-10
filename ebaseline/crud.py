@@ -151,6 +151,7 @@ def create_subject(db: Session, data: schemas.SubjectCreate) -> models.Subject:
         name=data.name,
         ipaddr=data.ipaddr,
         port=data.port,
+        api_path=data.api_path,
         secret=data.secret,
         api_mode=data.api_mode,
     )
@@ -178,6 +179,8 @@ def update_subject(db: Session, sid: int, data: schemas.SubjectUpdate) -> models
         subject.ipaddr = data.ipaddr
     if data.port is not None:
         subject.port = data.port
+    if data.api_path is not None:
+        subject.api_path = data.api_path
     if data.secret is not None:
         subject.secret = data.secret
     if data.api_mode is not None:

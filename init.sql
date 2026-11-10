@@ -76,6 +76,7 @@ name    char(32)      not null default '',                          -- 名称/�
 ipaddr 	char(32)      not null default '127.0.0.1',	                -- agent ipaddr
 port	int           not	null default 8642,			            -- agent port
 secret	varchar(128)  not null default '',			                -- apikey
+api_path varchar(125) not null default 'v1',                        -- agent API 端点路径，默认 v1（如 p/stream-qa/v1）
 api_mode int not null default 0					                -- api模式，0为OpenAI Responses API模式，其他类型待定
 );
 /*

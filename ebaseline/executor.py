@@ -24,7 +24,7 @@ from typing import Optional,  Any
 from sqlalchemy.orm import Session
 
 from . import crud, models, runtime
-from .agent_client import run_agent
+from .agent_client import build_base_url, run_agent
 from .config import get_config
 from .database import _get_session_factory
 from .metrics import result_verdict
@@ -673,8 +673,11 @@ def _execute_single_task(
             timeout_source = "全局默认"
 
     # 4. 调用 Agent
-    logger.log(f"\n--- 阶段 4: 调用 Agent ---\n目标: {subject.ipaddr}:{subject.port}\n超时: {agent_timeout}s（{timeout_source}）")
-    agent_base_url = f"http://{subject.ipaddr}:{subject.port}"
+    agent_base_url = build_base_url(subject.ipaddr, subject.port, subject.api_path)
+    logger.log(
+        f"\n--- 阶段 4: 调用 Agent ---\n目标: {agent_base_url}\n"
+        f"超时: {agent_timeout}s（{timeout_source}）"
+    )
     agent_result = run_agent(
         base_url=agent_base_url,
         api_key=subject.secret,

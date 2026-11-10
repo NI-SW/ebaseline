@@ -107,20 +107,37 @@ class TaskResponse(BaseModel):
 
 
 # ── Subject ────────────────────────────────────────────────────
+def _normalize_api_path(value: Optional[str]) -> str:
+    """规范化 Agent 端点路径：去掉空白与首尾斜杠，空值回退 v1。"""
+    return (value or "").strip().strip("/") or "v1"
+
+
 class SubjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=32)
     ipaddr: str = Field(..., max_length=32)
     port: int = Field(..., gt=0, le=65535)
+    api_path: str = Field("v1", max_length=125)
     secret: str = Field("", max_length=128)
     api_mode: int = Field(0, ge=0)
+
+    @field_validator("api_path")
+    @classmethod
+    def _norm_api_path(cls, value: str) -> str:
+        return _normalize_api_path(value)
 
 
 class SubjectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=32)
     ipaddr: Optional[str] = Field(None, max_length=32)
     port: Optional[int] = Field(None, gt=0, le=65535)
+    api_path: Optional[str] = Field(None, max_length=125)
     secret: Optional[str] = Field(None, max_length=128)
     api_mode: Optional[int] = Field(None, ge=0)
+
+    @field_validator("api_path")
+    @classmethod
+    def _norm_api_path(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else _normalize_api_path(value)
 
 
 class SubjectResponse(BaseModel):
@@ -128,10 +145,36 @@ class SubjectResponse(BaseModel):
     name: str
     ipaddr: str
     port: int
+    api_path: str
     api_mode: int
 
     class Config:
         from_attributes = True
+
+
+class SubjectTestRequest(BaseModel):
+    """测试待测 agent 端点连通性（不落库）。"""
+    ipaddr: str = Field(..., min_length=1, max_length=32)
+    port: int = Field(..., gt=0, le=65535)
+    api_path: str = Field("v1", max_length=125)
+    secret: str = Field("", max_length=128)
+    sid: Optional[int] = None  # 编辑已有主体时用于复用已保存的 API Key
+    timeout: int = Field(60, ge=5, le=600)
+
+    @field_validator("api_path")
+    @classmethod
+    def _norm_api_path(cls, value: str) -> str:
+        return _normalize_api_path(value)
+
+
+class SubjectTestResponse(BaseModel):
+    ok: bool
+    url: str
+    latency_ms: int
+    first_token_ms: Optional[int] = None
+    output: str = ""
+    error: str = ""
+    usage: dict[str, Any] = Field(default_factory=dict)
 
 
 # ── Batch ──────────────────────────────────────────────────────

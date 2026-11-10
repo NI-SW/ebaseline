@@ -1,7 +1,8 @@
-"""Agent API 客户端：OpenAI Responses API 格式（/v1/responses，SSE 流式）。
+"""Agent API 客户端：OpenAI Responses API 格式（{base_url}/responses，SSE 流式）。
 
 复用 /home/stream-agent/test/test_i2stream.py 的调用逻辑：
-- POST {base_url}/v1/responses 流式拉取 SSE
+- POST {base_url}/responses 流式拉取 SSE
+  base_url 由待测主体配置拼接：http://<ipaddr>:<port>/<api_path>（api_path 默认 v1）
 - 自动附加 AUTONOMY_DIRECTIVE（可在 config 关闭）
 - 检测到 Agent 请求确认时，自动追问（最多 max_follow_ups 次）
 - 支持 QA 闭环（conversation 字段）
@@ -45,6 +46,23 @@ _FOLLOW_UP_INSTRUCTION = (
 )
 
 _MAX_QA_ROUNDS = 3
+
+# 端点连通性测试用的最小提示词（避免触发实际业务操作）
+_TEST_PROMPT = "这是一次接口连通性测试，请不要调用任何工具，只回复：pong"
+
+
+def normalize_api_path(api_path: Optional[str]) -> str:
+    """规范化 Agent 端点路径：去掉空白与首尾斜杠，空值回退 v1。"""
+    return (api_path or "").strip().strip("/") or "v1"
+
+
+def build_base_url(ipaddr: str, port: int, api_path: Optional[str] = None) -> str:
+    """拼接 Agent 根地址：http://<ipaddr>:<port>/<api_path>（默认 v1）。
+
+    例如 api_path="/p/stream-qa/v1" 时得到
+    http://192.168.34.65:58642/p/stream-qa/v1，具体请求再加 /responses。
+    """
+    return f"http://{ipaddr}:{port}/{normalize_api_path(api_path)}"
 
 
 @dataclass
@@ -192,7 +210,7 @@ def _run_agent_once(
     deadline: float,
     origin: Optional[float] = None,
 ) -> dict:
-    """单轮 Agent 调用：POST /v1/responses，处理 SSE 流。
+    """单轮 Agent 调用：POST {base_url}/responses，处理 SSE 流。
 
     origin 为整个任务开始时间；首字延迟按它计算，避免多轮时被低估。
     """
@@ -300,6 +318,41 @@ def _run_agent_once(
     return _finalize()
 
 
+def test_endpoint(base_url: str, api_key: str, timeout: int = 60) -> dict:
+    """向 Agent 发送一次最小 Responses 请求，验证端点连通性。
+
+    Returns:
+        {ok, url, latency_ms, first_token_ms, output, error, usage}
+    """
+    url = f"{base_url.rstrip('/')}/responses"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    payload = {
+        "model": "hermes-agent",
+        "input": _TEST_PROMPT,
+        "execute": True,
+        "stream": True,
+    }
+    start = time.time()
+    raw = _run_agent_once(url, headers, payload, start + timeout, origin=start)
+    ok = not raw.get("error") and bool(
+        raw.get("final_payload") is not None or (raw.get("text") or "").strip()
+    )
+    error = raw.get("error") or ("" if ok else "未收到有效响应（无 SSE 事件）")
+    return {
+        "ok": ok,
+        "url": url,
+        "latency_ms": int((time.time() - start) * 1000),
+        "first_token_ms": raw.get("first_token_ms"),
+        "output": (raw.get("text") or "").strip()[:500],
+        "error": error,
+        "usage": raw.get("usage") or {},
+    }
+
+
 def run_agent(
     base_url: str,
     api_key: str,
@@ -310,7 +363,7 @@ def run_agent(
     """调用 Agent API 执行任务。
 
     Args:
-        base_url: Agent 服务地址（如 http://192.168.34.65:58642）
+        base_url: Agent 服务根地址（如 http://192.168.34.65:58642/v1）
         api_key: API key
         input_text: 自然语言指令
         timeout: 超时秒数（默认读 config）
@@ -324,7 +377,7 @@ def run_agent(
     max_follow_ups = cfg.agent_max_follow_ups
     autonomy = cfg.agent_autonomy_directive
 
-    url = f"{base_url.rstrip('/')}/v1/responses"
+    url = f"{base_url.rstrip('/')}/responses"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

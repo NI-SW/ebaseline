@@ -59,6 +59,8 @@ class Subject(Base):
     name: Mapped[str] = mapped_column(String(32), nullable=False, default="")  # 名称/代号
     ipaddr: Mapped[str] = mapped_column(String(32), nullable=False, default="127.0.0.1")
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=8642)
+    api_path: Mapped[str] = mapped_column(String(125), nullable=False, default="v1")
+    # Agent 端点路径（默认 v1；如 p/stream-qa/v1）
     secret: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     api_mode: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0=OpenAI Responses API 模式
@@ -148,7 +150,19 @@ def _ensure_columns() -> None:
 
     engine = _get_engine()
     insp = inspect(engine)
-    if "task_result" not in insp.get_table_names():
+    tables = set(insp.get_table_names())
+
+    # subjects：端点路径（旧库补列默认 v1，保持原 /v1/responses 调用行为）
+    if "subjects" in tables:
+        existing = {c["name"] for c in insp.get_columns("subjects")}
+        if "api_path" not in existing:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE subjects ADD COLUMN api_path VARCHAR(125) "
+                    "NOT NULL DEFAULT 'v1'"
+                ))
+
+    if "task_result" not in tables:
         return
 
     existing = {c["name"] for c in insp.get_columns("task_result")}

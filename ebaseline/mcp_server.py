@@ -104,6 +104,7 @@ def _subject_to_dict(subject: models.Subject) -> dict:
         "name": subject.name,
         "ipaddr": subject.ipaddr,
         "port": subject.port,
+        "api_path": subject.api_path,
         "api_mode": subject.api_mode,
     }
 
@@ -521,12 +522,19 @@ def create_subject(
     port: int,
     secret: str = "",
     api_mode: int = 0,
+    api_path: str = "v1",
 ) -> str:
-    """注册待测 agent。api_mode: 0=OpenAI Responses API。"""
+    """注册待测 agent。
+
+    api_path: Agent 端点路径，默认 v1；如填 p/stream-qa/v1 则调用
+    http://<ipaddr>:<port>/p/stream-qa/v1/responses。
+    api_mode: 0=OpenAI Responses API。
+    """
     db = _get_db()
     try:
         data = schemas.SubjectCreate(
-            name=name, ipaddr=ipaddr, port=port, secret=secret, api_mode=api_mode,
+            name=name, ipaddr=ipaddr, port=port, secret=secret,
+            api_mode=api_mode, api_path=api_path,
         )
         subject = crud.create_subject(db, data)
         return _dump(_subject_to_dict(subject))
@@ -542,6 +550,7 @@ def update_subject(
     port: Optional[int] = None,
     secret: Optional[str] = None,
     api_mode: Optional[int] = None,
+    api_path: Optional[str] = None,
 ) -> str:
     """更新待测 agent。参数为 None 表示不修改。"""
     db = _get_db()
@@ -557,6 +566,8 @@ def update_subject(
             fields["secret"] = secret
         if api_mode is not None:
             fields["api_mode"] = api_mode
+        if api_path is not None:
+            fields["api_path"] = api_path
         subject = crud.update_subject(db, sid, schemas.SubjectUpdate(**fields))
         if subject is None:
             return _dump({"error": f"待测主体 {sid} 不存在"})

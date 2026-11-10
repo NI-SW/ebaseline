@@ -123,7 +123,13 @@ ebaseline/
 
 ### 待测主体（subjects）
 
-被测试的 Agent 服务地址配置（IP + 端口 + API Key）。
+被测试的 Agent 服务地址配置（IP + 端口 + 端点路径 + API Key）。
+
+端点路径默认 `v1`，调用地址为 `http://<ipaddr>:<port>/<api_path>/responses`；
+例如端点路径填 `/p/stream-qa/v1` 时调用 `http://<ipaddr>:<port>/p/stream-qa/v1/responses`。
+
+注册/编辑弹窗提供“测试端点”按钮：向目标端点发送一次最小 Responses 请求（提示模型只回复
+`pong`），返回连通状态、总耗时、首字延迟和模型回复，便于保存前验证模型连通性。
 
 ### 批次（task_batch）
 
@@ -156,6 +162,7 @@ ebaseline/
 
 ### 待测主体
 - `POST /api/v1/subjects` - 注册（需管理员）
+- `POST /api/v1/subjects/test` - 测试端点连通性（需管理员，不保存）
 - `GET /api/v1/subjects` - 列表
 - `GET /api/v1/subjects/{sid}` - 详情
 - `PUT /api/v1/subjects/{sid}` - 更新（需管理员）

@@ -571,13 +571,14 @@ async function pageSubjects() {
   $('#content').innerHTML = `
   <div class="card">
     <div class="flex-between"><h2>待测 Agent 列表</h2>${canEdit ? '<button class="btn" onclick="showSubjectModal()">+ 注册 Agent</button>' : ''}</div>
-    <table><thead><tr><th>ID</th><th>名称</th><th>地址</th><th>端口</th><th>API 模式</th><th>操作</th></tr></thead>
+    <table><thead><tr><th>ID</th><th>名称</th><th>地址</th><th>端口</th><th>端点路径</th><th>API 模式</th><th>操作</th></tr></thead>
     <tbody>${subjects.map(s => `<tr>
       <td>${s.id}</td><td>${esc(s.name || '-')}</td><td class="mono">${esc(s.ipaddr)}</td><td class="mono">${s.port}</td>
+      <td class="mono">/${esc(s.api_path || 'v1')}</td>
       <td><span class="tag tag-blue">${s.api_mode === 0 ? 'OpenAI Responses' : '模式 ' + s.api_mode}</span></td>
       <td>${canEdit ? `<button class="btn btn-sm btn-default" onclick="showSubjectModal(${jsArg(s)})">编辑</button>
       <button class="btn btn-sm btn-danger" onclick="delSubject(${s.id})">删除</button>` : ''}</td>
-    </tr>`).join('') || '<tr><td colspan="6" class="empty">暂无待测主体</td></tr>'}
+    </tr>`).join('') || '<tr><td colspan="7" class="empty">暂无待测主体</td></tr>'}
     </tbody></table>
   </div>`;
 }
@@ -588,16 +589,58 @@ function showSubjectModal(s) {
     <div class="form-item"><label>名称 / 代号</label><input id="s_name" value="${esc(s?.name || '')}" placeholder="如：生产环境 Hermes Agent" maxlength="32"></div>
     <div class="form-item"><label>IP 地址</label><input id="s_ip" value="${esc(s?.ipaddr || '')}" placeholder="192.168.34.65" maxlength="32"></div>
     <div class="form-item"><label>端口</label><input id="s_port" type="number" value="${s?.port || 58642}"></div>
+    <div class="form-item"><label>端点路径</label>
+      <div style="display:flex;gap:8px">
+        <input id="s_path" value="${esc(s?.api_path || 'v1')}" placeholder="默认 v1，如 p/stream-qa/v1 或 /p/stream-qa/v1" maxlength="125" style="flex:1">
+        <button type="button" class="btn btn-default" id="s_test_btn" onclick="testSubjectEndpoint(${isEdit ? s.id : 'null'})">测试端点</button>
+      </div>
+      <div id="s_test_result" class="mono" style="margin-top:8px;font-size:12px;color:#666;white-space:pre-wrap;word-break:break-all"></div>
+    </div>
     <div class="form-item"><label>API Key</label><input id="s_secret" value="" placeholder="${isEdit ? '留空则不修改' : ''}"></div>
     <div class="form-item"><label>API 模式</label><select id="s_mode"><option value="0" ${s?.api_mode === 0 ? 'selected' : ''}>OpenAI Responses API</option></select></div>
   `, async () => {
-    const body = { name: $('#s_name').value, ipaddr: $('#s_ip').value, port: parseInt($('#s_port').value), api_mode: parseInt($('#s_mode').value) };
+    const body = { name: $('#s_name').value, ipaddr: $('#s_ip').value, port: parseInt($('#s_port').value), api_path: $('#s_path').value.trim() || 'v1', api_mode: parseInt($('#s_mode').value) };
     const secret = $('#s_secret').value;
     if (secret || !isEdit) body.secret = secret;
     if (isEdit) await api(`/api/v1/subjects/${s.id}`, { method: 'PUT', body: JSON.stringify(body) });
     else await api('/api/v1/subjects', { method: 'POST', body: JSON.stringify(body) });
     toast('保存成功'); pageSubjects();
   });
+}
+
+async function testSubjectEndpoint(sid) {
+  const btn = $('#s_test_btn');
+  const box = $('#s_test_result');
+  const ipaddr = $('#s_ip').value.trim();
+  const port = parseInt($('#s_port').value);
+  const api_path = $('#s_path').value.trim() || 'v1';
+  if (!ipaddr || !port) { toast('请先填写 IP 地址和端口', 'error'); return; }
+  btn.disabled = true; btn.textContent = '测试中...';
+  box.style.color = '#666'; box.textContent = '正在连接 Agent 端点…';
+  try {
+    const body = { ipaddr, port, api_path, timeout: 60 };
+    const secret = $('#s_secret').value;
+    if (secret) body.secret = secret;
+    if (sid) body.sid = sid;
+    const r = await api('/api/v1/subjects/test', { method: 'POST', body: JSON.stringify(body) });
+    const lines = [`测试地址：${r.url}`];
+    if (r.ok) {
+      const timing = `${r.latency_ms}ms${r.first_token_ms != null ? `，首字 ${r.first_token_ms}ms` : ''}`;
+      lines.unshift(`✔ 连接成功（${timing}）`);
+      if (r.output) lines.push(`模型回复：${r.output}`);
+      box.style.color = '#137333';
+    } else {
+      lines.unshift('✖ 连接失败');
+      lines.push(`错误：${r.error || '未知错误'}`);
+      box.style.color = '#c5221f';
+    }
+    box.textContent = lines.join('\n');
+  } catch (e) {
+    box.style.color = '#c5221f';
+    box.textContent = `✖ 测试失败：${e.message}`;
+  } finally {
+    btn.disabled = false; btn.textContent = '测试端点';
+  }
 }
 
 async function delSubject(sid) {

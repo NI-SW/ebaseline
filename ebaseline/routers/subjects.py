@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import crud, models, schemas
+from ..agent_client import build_base_url, test_endpoint
 from ..auth import get_current_user, require_privilege
 from ..database import get_db
 
@@ -28,6 +29,25 @@ def list_subjects(
 ):
     """列出所有待测 agent。"""
     return crud.list_subjects(db)
+
+
+@router.post("/test", response_model=schemas.SubjectTestResponse)
+def test_subject_endpoint(
+    data: schemas.SubjectTestRequest,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(require_privilege(1)),
+):
+    """测试待测 agent 端点连通性（不保存主体）。"""
+    secret = data.secret
+    if not secret and data.sid is not None:
+        subject = crud.get_subject(db, data.sid)
+        if subject is None:
+            raise HTTPException(status_code=404, detail="待测主体不存在")
+        # 仅在目标地址未改动时复用已保存的 API Key，避免密钥被发往任意地址
+        if subject.ipaddr == data.ipaddr and subject.port == data.port:
+            secret = subject.secret
+    base_url = build_base_url(data.ipaddr, data.port, data.api_path)
+    return test_endpoint(base_url, secret, timeout=data.timeout)
 
 
 @router.get("/{sid}", response_model=schemas.SubjectResponse)
