@@ -17,7 +17,7 @@ button { cursor: pointer; }
 .sidebar .logo small { display: block; font-size: 12px; font-weight: 400; color: #ffffff88; margin-top: 4px; }
 .sidebar nav a { display: block; padding: 12px 20px; color: #ffffffb3; font-size: 14px; }
 .sidebar nav a:hover, .sidebar nav a.active { background: #1890ff; color: #fff; }
-.main { flex: 1; padding: 24px; overflow-x: auto; }
+.main { flex: 1; min-width: 0; padding: 24px; overflow-x: auto; }
 .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .topbar h1 { font-size: 20px; }
 .topbar .user { font-size: 14px; color: #666; }
@@ -101,6 +101,18 @@ input:focus, textarea:focus { border-color: #1890ff; outline: none; }
 .batch-group-body { border-top: 1px solid #f0f0f0; padding: 4px 18px 12px; }
 .batch-group-body table th { background: #fafafa; }
 .table-wrap { overflow-x: auto; }
+/* ── 固定列宽 / 右侧操作列 ── */
+.fixed-table { table-layout: fixed; border-collapse: separate; border-spacing: 0; line-height: 1.5; }
+.batch-results-table { min-width: 1240px; }
+.task-list-table { min-width: 1120px; }
+.fixed-table th, .fixed-table td { padding: 10px 8px; overflow-wrap: anywhere; }
+.fixed-table th { white-space: normal; }
+.fixed-table .tag, .fixed-table .btn { white-space: nowrap; }
+.fixed-table .table-actions { position: sticky; right: 0; z-index: 1; background: #fff; box-shadow: -4px 0 6px -4px #0003; }
+.fixed-table th.table-actions { z-index: 2; background: #fafafa; }
+.fixed-table tr:hover td.table-actions { background: #fafcff; }
+.fixed-table .table-actions .flex { flex-wrap: nowrap; gap: 6px; }
+.fixed-table .table-actions .btn { flex-shrink: 0; }
 .flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .flex-between { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* ── 全屏日志查看器 ── */
@@ -483,7 +495,13 @@ async function pageTasks(gid, gname) {
         ${canEdit ? `<button class="btn" onclick="showTaskModal(${gid})">+ 新建任务</button>` : ''}
       </div>
     </div>
-    <table><thead><tr><th>TID</th><th>名称</th><th>依赖</th><th>前置脚本</th><th>校验脚本</th><th>清理脚本</th><th>超时(秒)</th><th>操作</th></tr></thead>
+    <div class="table-wrap"><table class="fixed-table task-list-table">
+    <colgroup>
+      <col style="width:76px"><col style="width:220px"><col style="width:84px">
+      <col style="width:156px"><col style="width:156px"><col style="width:156px">
+      <col style="width:96px"><col style="width:176px">
+    </colgroup>
+    <thead><tr><th>TID</th><th>名称</th><th>依赖</th><th>前置脚本</th><th>校验脚本</th><th>清理脚本</th><th>超时(秒)</th><th class="table-actions">操作</th></tr></thead>
     <tbody>${tasks.map(t => `<tr>
       <td class="mono">${t.tid}</td><td>${esc(t.name)}</td>
       <td class="mono">${(t.depends || []).join(', ') || '-'}</td>
@@ -491,12 +509,12 @@ async function pageTasks(gid, gname) {
       <td class="mono">${esc(t.expect || '-')}</td>
       <td class="mono">${esc(t.clean || '-')}</td>
       <td class="mono">${t.timeout != null ? t.timeout : '默认'}</td>
-      <td>
+      <td class="table-actions"><div class="flex">
         <button class="btn btn-sm btn-default" onclick="viewTask(${jsArg(t)})">详情</button>
         ${canEdit ? `<button class="btn btn-sm btn-default" onclick="showTaskModal(${jsArg(gid, t)})">编辑</button>
         <button class="btn btn-sm btn-danger" onclick="delTask(${jsArg(t.tid, gid, gname)})">删除</button>` : ''}
-      </td></tr>`).join('') || '<tr><td colspan="8" class="empty">暂无任务</td></tr>'}
-    </tbody></table>
+      </div></td></tr>`).join('') || '<tr><td colspan="8" class="empty">暂无任务</td></tr>'}
+    </tbody></table></div>
   </div>
   <div class="card"><h2>组变量</h2><div class="log-view">${esc(JSON.stringify(group.variables, null, 2) || '{}')}</div></div>`;
 }
@@ -987,8 +1005,13 @@ async function batchDetail(bid, fromPage = 'batches') {
     </div>
   </div>
   <div class="card"><h2>任务执行结果</h2>
-    <div class="table-wrap"><table>
-    <thead><tr><th>TID</th><th>任务</th><th>依赖</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
+    <div class="table-wrap"><table class="fixed-table batch-results-table">
+    <colgroup>
+      <col style="width:76px"><col style="width:220px"><col style="width:84px"><col style="width:84px">
+      <col style="width:72px"><col style="width:84px"><col style="width:72px"><col style="width:72px">
+      <col style="width:120px"><col style="width:84px"><col style="width:120px"><col style="width:152px">
+    </colgroup>
+    <thead><tr><th>TID</th><th>任务</th><th>依赖</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th class="table-actions">操作</th></tr></thead>
     <tbody>${tasks.map(t => {
       const tm = t.metrics || {};
       const token = tm.tokens
@@ -1016,7 +1039,7 @@ async function batchDetail(bid, fromPage = 'batches') {
         <td class="mono">${token}</td>
         <td>${fmtMs(tm.first_token_ms)}</td>
         <td class="mono">${t.create_time ? new Date(t.create_time).toLocaleString('zh-CN') : '-'}</td>
-        <td><div class="flex" style="flex-wrap:nowrap;gap:6px">${logBtn}${runBtn}</div></td></tr>`;
+        <td class="table-actions"><div class="flex">${logBtn}${runBtn}</div></td></tr>`;
     }).join('') || '<tr><td colspan="12" class="empty">暂无任务</td></tr>'}
     </tbody></table></div>
   </div>`;
