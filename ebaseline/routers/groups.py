@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from .. import crud, models, runtime, schemas
 from ..auth import get_current_user, require_privilege
+from ..config import get_config
 from ..database import get_db
+from ..security import mask_variables
 from .workspace import delete_workspace
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,9 @@ def _group_to_response(group: models.TaskGroup) -> schemas.TaskGroupResponse:
             variables = json.loads(group.variables)
         except json.JSONDecodeError:
             variables = None
+    cfg = get_config()
+    if variables is not None and cfg.security_mask_group_secrets:
+        variables = mask_variables(variables, cfg.security_mask_placeholder)
     return schemas.TaskGroupResponse(
         id=group.id,
         name=group.name,

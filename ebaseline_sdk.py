@@ -107,7 +107,13 @@ def _latest_context_file(root: Path, gid: int) -> Optional[Path]:
     group_root = root / "ebase_runs" / f"group_{gid}"
     if not group_root.is_dir():
         return None
-    candidates = [p for p in group_root.glob("batch_*/*.json") if not p.name.endswith(".qa.json")]
+    # 新布局 batch_<bid>/attempt_<n>/<tid>.json；旧布局 batch_<bid>/<tid>.json
+    candidates = [
+        p
+        for pattern in ("batch_*/attempt_*/*.json", "batch_*/*.json")
+        for p in group_root.glob(pattern)
+        if not p.name.endswith(".qa.json")
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -196,10 +202,11 @@ def task() -> dict:
 
 
 def metadata() -> dict:
-    """批次级元信息：batch_id/sid/gid/tid/stage/updated_at。"""
+    """批次级元信息：batch_id/attempt/sid/gid/tid/stage/updated_at。"""
     ctx = context()
     return {
         "batch_id": ctx.get("batch_id"),
+        "attempt": ctx.get("attempt"),
         "sid": ctx.get("sid"),
         "gid": ctx.get("gid"),
         "tid": ctx.get("tid"),

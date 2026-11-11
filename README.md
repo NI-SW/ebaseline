@@ -5,12 +5,20 @@
 ## 功能特性
 
 - **REST API**：用户管理、任务组/任务 CRUD、批次执行、结果查询与导出
-- **MCP 服务**：智能体可直接通过 MCP 协议操作测试任务（拉取任务、上报结果）
-- **任务执行引擎**：支持前置脚本、Agent 调用、期望校验、清理脚本四阶段
-- **依赖拓扑排序**：自动按任务依赖关系排序执行
-- **变量替换**：支持 `{VAR}` 和 `{VAR.SUBVAR}` 占位符，从任务组变量中取值
+- **MCP 服务**：智能体可通过 MCP 协议操作测试任务（拉取任务、上报结果），
+  必须携带 Bearer token；写工具仅 admin 角色可用
+- **任务执行引擎**：支持前置脚本、Agent 调用、期望校验、清理脚本四阶段，
+  脚本在独立进程组中运行，可取消、超时整组回收
+- **依赖拓扑排序**：保存/执行前校验缺失、跨组、自依赖和环路，拒绝非法依赖图
+- **变量替换**：支持 `{VAR}` 和 `{VAR.SUBVAR}` 占位符；组变量中的秘密字段在
+  API/页面/日志中脱敏
 - **QA 闭环**：支持多轮对话自动应答（conversation 字段）
-- **权限控制**：三级权限（0=普通用户，1=管理员，2=超级管理员）
+- **权限控制**：三级权限（0=普通用户，1=管理员，2=超级管理员）；
+  Web 终端默认仅管理员可用，root 服务默认禁用
+- **用户管理**：登录用户可自助修改用户名/邮箱/密码，生成或撤销个人
+  MCP API Key；管理员可查看用户列表、调整权限、撤销他人 Key
+- **可追溯评测**：批次创建时冻结任务/变量/脚本 hash（manifest）；重跑追加
+  attempt 而不覆盖历史；无校验脚本的执行成功标记为“未校验”而不是“通过”
 
 ## 快速开始
 
@@ -49,9 +57,12 @@ python main.py -f env.conf
 启动后：
 - **Web 控制台（主页）**: http://0.0.0.0:8080/ — 普通用户的操作入口（登录后可视化管理任务组/任务/待测主体/批次/结果）
 - REST API 文档（Swagger）: http://0.0.0.0:8080/docs
-- MCP 服务（供智能体接入）: http://0.0.0.0:8081/mcp
+- MCP 服务（供智能体接入）: http://127.0.0.1:8081/mcp（需 Bearer token）
 
-默认管理员账号：`admin` / `admin123`
+初始管理员账号为 `admin`：密码取 `auth.initial_admin_password` / `EBASE_ADMIN_PASSWORD`，
+未配置时首次启动随机生成并在启动日志提示一次。MCP token 未配置时自动生成到
+`runtime/mcp_token`（0600），客户端需设置 `Authorization: Bearer <文件内容>`。
+终端/MCP/组变量的安全边界见 [docs/security.md](docs/security.md)。
 
 Web 控制台功能：
 - **任务组**：列表、新建/编辑（含 JSON 变量编辑）、删除、进入任务列表
@@ -59,6 +70,8 @@ Web 控制台功能：
 - **待测主体**：注册/编辑/删除 Agent（地址、端口、API Key、API 模式）
 - **测试批次**：创建批次（选 Agent + 任务组）、执行/取消、查看每任务执行状态与日志
 - **执行结果**：全量结果列表、按条件过滤、导出 CSV、查看详细日志
+- **用户管理**：修改自己的用户名/邮箱/密码；生成/撤销个人 MCP API Key；
+  管理员可调整用户权限、撤销他人 Key
 
 ### 5. 导入 DB2 测试用例组
 
@@ -79,10 +92,14 @@ ebaseline/
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码散列
 │   ├── crud.py              # 通用 CRUD
-│   ├── agent_client.py      # Agent /v1/responses SSE 调用
-│   ├── executor.py          # 任务执行引擎（异步线程池）
-│   ├── runtime.py           # 运行上下文快照（runtime/ 下，供 SDK 读取）
-│   ├── mcp_server.py        # MCP 服务（FastMCP streamable HTTP）
+│   ├── task_graph.py        # 依赖校验/拓扑排序
+│   ├── manifest.py          # 批次冻结清单（任务/变量/脚本 hash）
+│   ├── security.py          # 组变量脱敏与日志脱敏
+│   ├── mcp_auth.py          # MCP Bearer token 认证与角色
+│   ├── agent_client.py      # Agent /v1/responses SSE 调用（支持取消）
+│   ├── executor.py          # 任务执行引擎（异步线程池 + attempt/manifest）
+│   ├── runtime.py           # 运行上下文快照（runtime/.../attempt_N/，供 SDK 读取）
+│   ├── mcp_server.py        # MCP 服务（FastMCP streamable HTTP + token 认证）
 │   └── routers/             # REST API 路由
 │       ├── auth.py          # POST /auth/register, /auth/login
 │       ├── users.py         # GET/PUT /users
@@ -127,18 +144,31 @@ ebaseline/
 
 ### 批次（task_batch）
 
-一次测试执行的批次记录，包含执行状态（0=未执行，1=执行中，2=已完成，3=失败，4=部分成功）。
+一次测试执行的批次记录，包含执行状态（0=未执行，1=执行中，2=已完成，3=失败，
+4=部分成功，5=已取消）。创建时把任务定义、组变量和脚本 sha256 冻结到 `manifest`；
+整批重跑时 `attempt` +1，使用冻结定义，历史结果不删除。
 
 ### 结果（task_result）
 
-每个任务的执行结果（0=未执行，1=成功，2=失败）及详细日志。
+每个任务的执行结果（0=未执行，1=执行成功，2=失败，3=执行中）及详细日志。
+`result_detail`：3=执行成功但未校验（UNVALIDATED）、2=已校验通过（PASS）、
+1=校验通过但 Agent 异常（PARTIAL）、0=失败。`attempt` 标记所属轮次。
 
 ## API 概览
 
 ### 认证
 - `POST /api/v1/auth/register` - 注册
 - `POST /api/v1/auth/login` - 登录
-- `GET /api/v1/auth/me` - 当前用户
+- `GET /api/v1/auth/me` - 当前用户（含 API Key 前缀/生成时间/最近使用时间）
+
+### 用户/账户
+- `GET /api/v1/users` - 用户列表（需管理员）
+- `PUT /api/v1/users/me/profile` - 修改自己的用户名/邮箱（需当前密码）
+- `PUT /api/v1/users/me/password` - 修改自己的密码（需当前密码）
+- `POST /api/v1/users/me/api-key` - 生成/重新生成个人 MCP API Key（明文仅返回一次）
+- `DELETE /api/v1/users/me/api-key` - 撤销自己的 API Key
+- `PUT /api/v1/users/{id}/privilege` - 调整用户权限（需管理员）
+- `DELETE /api/v1/users/{id}/api-key` - 撤销指定用户的 API Key（需管理员）
 
 ### 任务组
 - `POST /api/v1/groups` - 创建（需管理员）
@@ -164,19 +194,38 @@ ebaseline/
 ### 批次
 - `POST /api/v1/batches` - 创建
 - `GET /api/v1/batches` - 列表
-- `GET /api/v1/batches/{id}` - 详情（含任务状态）
-- `POST /api/v1/batches/{id}/run` - 执行
+- `GET /api/v1/batches/{id}` - 详情（含任务状态；`?attempt=N` 查看历史轮次）
+- `GET /api/v1/batches/{id}/precheck` - 执行前预检（依赖图/未校验任务/脚本缺失）
+- `GET /api/v1/batches/{id}/attempts` - 每轮 attempt 的指标
+- `POST /api/v1/batches/{id}/run` - 执行（先校验依赖图）
 - `POST /api/v1/batches/{id}/tasks/{tid}/run` - 单独执行批次内任务（`?force=true` 忽略依赖）
-- `POST /api/v1/batches/{id}/cancel` - 取消
+- `POST /api/v1/batches/{id}/cancel` - 取消（中断正在运行的脚本/Agent 调用）
 - `DELETE /api/v1/batches/{id}` - 删除（需管理员）
 
 ### 结果
-- `GET /api/v1/results` - 查询（支持 sid/gid/tid/result 过滤）
-- `GET /api/v1/results/export` - 导出 CSV
+- `GET /api/v1/results` - 查询（支持 sid/gid/tid/result/batch_id/attempt 过滤）
+- `GET /api/v1/results/export` - 导出 CSV（支持 `attempt`）
+
+### 工作空间
+- `GET /api/v1/workspace/capabilities` - 当前用户的终端可用性
+- `GET /api/v1/groups/{gid}/workspace/files|file` - 文件浏览/读取
+- `PUT /api/v1/groups/{gid}/workspace/file`、`POST .../mkdir`、`DELETE .../file` - 写入/建目录/删除（需管理员）
+- `WS /api/v1/groups/{gid}/workspace/terminal` - Web 终端（默认需管理员且非 root 服务）
 
 ## MCP 工具
 
-智能体可通过 MCP 客户端连接 `http://<host>:8081/mcp` 使用以下工具（共 36 个）：
+智能体可通过 MCP 客户端连接 `http://127.0.0.1:8081/mcp`，并在请求头设置
+`Authorization: Bearer <token>`。
+
+- **个人 API Key（推荐）**：登录 Web 控制台 →「用户管理」→ 生成 API Key，格式 `ebk_...`。
+  明文只显示一次，数据库只存 SHA-256。角色由用户等级决定：等级 0 只能调用只读工具，
+  等级 ≥1 可调用写工具；用户被降级后权限立即变化。
+- **服务级 token**：`mcp.auth_token` / `EBASE_MCP_TOKEN`，未配置时读取
+  `runtime/mcp_token`（首次启动自动生成）；`mcp.readonly_token` 为服务级只读 token。
+- 写工具、`render_task_prompt` 需要 admin 角色；`render_task_prompt` 会用真实变量渲染，
+  可能带出秘密，因此不对只读 Key 开放。
+
+共 36 个工具：
 
 ### 任务组与任务
 
@@ -239,19 +288,23 @@ ebaseline/
 ## 任务执行流程
 
 ```
-对于批次中的每个任务（按依赖拓扑排序）：
+对于批次中的每个任务（按冻结清单/依赖拓扑排序）：
 1. 检查依赖：依赖任务必须全部 result=1（成功）
-2. 执行 pre_script（如果配置了）
+2. 执行 pre_script（如果配置了；独立进程组，可取消）
 3. 渲染 prompt：替换 {VAR} 和 {VAR.SUBVAR} 占位符
 4. 调用 Agent API（OpenAI Responses API 格式，SSE 流式）
    - 超时时间取 task_list.timeout，未配置时使用全局默认 agent.default_timeout
    - 自动附加自主执行指令（可在配置关闭）
    - 检测到请求确认时自动追问
    - 支持 conversation 多轮 QA 闭环
-5. 执行 expect 校验脚本（返回码 0=成功）
-6. 执行 clean 清理脚本（无论成败）
-7. 写 task_result 到数据库
+   - 取消信号可中断流式读取
+5. 执行 expect 校验脚本（返回码 0=成功；未配置则结果为“未校验”）
+6. 执行 clean 清理脚本（finally 中执行；失败会把该任务判为 FAIL）
+7. 写 task_result 到数据库（带 attempt；重跑追加，不覆盖历史）
 ```
+
+批次状态与判定分离：批次状态描述“执行是否走完”，任务 verdict 描述“质量是否通过”。
+无 expect 的任务即使 Agent 执行成功也只算 `UNVALIDATED`，不计入严格通过率。
 
 ## 变量替换
 
@@ -285,7 +338,8 @@ ebaseline/
 
 ### 用 SDK 读取 Agent 输出（推荐）
 
-执行器把每个任务的运行上下文写进 `runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.json`，
+执行器把每个任务的运行上下文写进
+`runtime/ebase_runs/group_<gid>/batch_<bid>/attempt_<n>/<tid>.json`，
 脚本通过 `ebaseline_sdk`（单文件、纯标准库、无需在组 venv 里安装）直接读取：
 
 ```python
@@ -326,12 +380,42 @@ eb.report(ok=True, detail={...})  # 输出 JSON 并按 ok 设置退出码
     "schema": "ebase"
   },
   "server": {"host": "0.0.0.0", "port": 8080},
-  "mcp": {"enabled": true, "host": "0.0.0.0", "port": 8081, "path": "/mcp"},
-  "auth": {"secret_key": "change-me", "token_expire_minutes": 1440},
+  "mcp": {
+    "enabled": true, "host": "127.0.0.1", "port": 8081, "path": "/mcp",
+    "auth_token": "", "readonly_token": "",
+    "token_file": "runtime/mcp_token",
+    "allow_unauthenticated": false,
+    "allowed_hosts": [], "allowed_origins": []
+  },
+  "workspace": {
+    "terminal_enabled": true,
+    "terminal_min_privilege": 1,
+    "allow_root_execution": false
+  },
+  "security": {"mask_group_secrets": true, "mask_placeholder": "********"},
+  "auth": {
+    "secret_key": "change-me", "token_expire_minutes": 1440,
+    "allow_register": true, "allow_init_admin": false,
+    "initial_admin_password": ""
+  },
   "agent": {"default_timeout": 300, "max_follow_ups": 3, "autonomy_directive": true},
   "scripts": {"base_dir": "./scripts", "shell": "/bin/bash"}
 }
 ```
+
+`mcp.allowed_hosts` / `allowed_origins` 用于跨机访问时放开 SDK 的 Host/Origin 白名单；
+默认只允许 localhost。`workspace.allow_root_execution` 默认 false：以 root 运行时
+Web 终端会被拒绝，必须显式开启或改用非 root 账号/容器运行。
+
+## 测试
+
+```bash
+source venv/bin/activate
+python -m unittest discover -s tests -v
+```
+
+测试使用标准库 `unittest`，不需要 MySQL 或真实 Agent：CRUD/manifest 用 SQLite
+内存库，脚本取消用本地进程验证。安全配置与部署检查见 [docs/security.md](docs/security.md)。
 
 ## 与现有测试框架的关系
 

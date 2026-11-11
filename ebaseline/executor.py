@@ -12,22 +12,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional,  Any
 
 from sqlalchemy.orm import Session
 
-from . import crud, models, runtime
+from . import crud, manifest as manifest_mod, models, runtime, task_graph
 from .agent_client import run_agent
 from .config import get_config
 from .database import _get_session_factory
 from .metrics import result_verdict
+from .security import collect_secret_values, redact_text
+
+logger = logging.getLogger(__name__)
 
 # 全局线程池：批次执行异步化
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ebexec")
@@ -81,8 +84,29 @@ def render_variables(text: str, variables: dict[str, Any]) -> str:
     return text.replace("\x00LB\x00", "{").replace("\x00RB\x00", "}")
 
 
+def _terminate_process_group(proc: subprocess.Popen, grace: float = 3.0) -> None:
+    """先 TERM 整个进程组，超时后 KILL，避免脚本子进程残留。"""
+    import os
+    import signal
+
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def _run_script(script_path: str, timeout: int = 300, extra_env: Optional[dict] = None,
-                workspace: Optional[Path] = None, stdin_text: Optional[str] = None) -> dict:
+                workspace: Optional[Path] = None, stdin_text: Optional[str] = None,
+                cancel_event: Optional[threading.Event] = None) -> dict:
     """执行脚本，返回 {returncode, stdout, stderr, success}。
 
     script_path 可以是：
@@ -204,82 +228,140 @@ def _run_script(script_path: str, timeout: int = 300, extra_env: Optional[dict] 
         env["EBASE_WORKSPACE"] = str(workspace)
         env["PATH"] = f"{Path(python_bin).parent}:{env.get('PATH', '')}"
 
-    # 脚本运行目录：工作空间优先
-    run_cwd = str(workspace) if workspace and workspace.exists() else str(base)
+    # 脚本运行目录：工作空间优先；配置的 scripts 目录不存在时回退到项目根，
+    # 避免内联命令（如 bash -c）因为 cwd 不存在而启动失败
+    if workspace and workspace.exists():
+        run_cwd = str(workspace)
+    elif base.exists():
+        run_cwd = str(base)
+    else:
+        run_cwd = str(Path(__file__).resolve().parent.parent)
 
     try:
-        r = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
             cwd=run_cwd,
             env=env,
-            input=stdin_text,
+            start_new_session=True,  # 独立进程组：取消/超时可整组回收
         )
-        return {
-            "returncode": r.returncode,
-            "stdout": r.stdout,
-            "stderr": r.stderr,
-            "success": r.returncode == 0,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"脚本超时 ({timeout}s)",
-            "success": False,
-        }
     except Exception as e:
         return {
             "returncode": -1,
             "stdout": "",
-            "stderr": f"脚本执行异常: {e}",
+            "stderr": f"脚本启动异常: {e}",
             "success": False,
         }
 
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def _drain(pipe, sink: list[str]) -> None:
+        try:
+            for chunk in iter(pipe.readline, ""):
+                sink.append(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    reader_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_parts), daemon=True)
+    reader_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_parts), daemon=True)
+    reader_out.start()
+    reader_err.start()
+
+    if stdin_text is not None and proc.stdin is not None:
+        def _feed_stdin() -> None:
+            try:
+                proc.stdin.write(stdin_text)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        threading.Thread(target=_feed_stdin, daemon=True).start()
+
+    deadline = time.monotonic() + timeout
+    cancelled = False
+    timed_out = False
+    while proc.poll() is None:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            _terminate_process_group(proc)
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _terminate_process_group(proc)
+            break
+        time.sleep(0.1)
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    reader_out.join(timeout=2)
+    reader_err.join(timeout=2)
+
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+    if cancelled:
+        stderr = (stderr + "\n" if stderr else "") + "已取消"
+        return {
+            "returncode": -2,
+            "stdout": stdout,
+            "stderr": stderr,
+            "success": False,
+            "cancelled": True,
+        }
+    if timed_out:
+        stderr = (stderr + "\n" if stderr else "") + f"脚本超时 ({timeout}s)"
+        return {
+            "returncode": -1,
+            "stdout": stdout,
+            "stderr": stderr,
+            "success": False,
+            "timed_out": True,
+        }
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "success": proc.returncode == 0,
+        "cancelled": False,
+    }
+
 
 def _parse_depends(depends_str: Optional[str]) -> list[int]:
-    if not depends_str:
-        return []
-    return [int(x.strip()) for x in depends_str.split(",") if x.strip()]
+    return task_graph.parse_depends(depends_str)
 
 
 def _topological_sort(tasks: list[models.TaskList]) -> list[models.TaskList]:
-    """按依赖拓扑排序。仅处理组内依赖；循环依赖的任务追加到末尾。"""
-    by_tid = {t.tid: t for t in tasks}
-    in_degree: dict[int, int] = {t.tid: 0 for t in tasks}
-    graph: dict[int, list[int]] = {t.tid: [] for t in tasks}
-
-    for t in tasks:
-        for dep_tid in _parse_depends(t.depends):
-            if dep_tid in by_tid:
-                in_degree[t.tid] += 1
-                graph[dep_tid].append(t.tid)
-
-    queue = deque([tid for tid, deg in in_degree.items() if deg == 0])
-    sorted_tids = []
-    while queue:
-        tid = queue.popleft()
-        sorted_tids.append(tid)
-        for nxt in graph[tid]:
-            in_degree[nxt] -= 1
-            if in_degree[nxt] == 0:
-                queue.append(nxt)
-
-    # 循环依赖的任务追加到末尾
-    remaining = [tid for tid in by_tid if tid not in sorted_tids]
-    sorted_tids.extend(remaining)
-    return [by_tid[tid] for tid in sorted_tids]
+    """按依赖拓扑排序；缺失/跨组/自依赖/循环依赖直接抛 DependencyError。"""
+    return task_graph.topological_sort(tasks)
 
 
-def _check_dependencies(db: Session, batch: models.TaskBatch, task: models.TaskList) -> tuple[bool, str]:
-    """检查任务的所有依赖是否都已成功。"""
+def _check_dependencies(db: Session, batch: models.TaskBatch, task: models.TaskList,
+                        attempt: Optional[int] = None) -> tuple[bool, str]:
+    """检查任务的所有依赖是否都已成功。
+
+    attempt>0 时只认本轮结果，避免上一轮的旧结果让下游误以为依赖已满足；
+    attempt=0/None 兼容旧数据（旧结果没有 attempt 字段）。
+    """
     deps = _parse_depends(task.depends)
     if not deps:
         return True, ""
     for dep_tid in deps:
-        result = crud.get_batch_task_result(db, batch.id, dep_tid)
+        result = crud.get_batch_task_result(
+            db, batch.id, dep_tid, attempt=attempt if attempt else None)
         if result is None:
             return False, f"依赖任务 {dep_tid} 未执行"
         if result.result != 1:
@@ -325,17 +407,21 @@ class _RunContext:
     """
 
     def __init__(self, batch: models.TaskBatch, group: models.TaskGroup,
-                 task: models.TaskList):
-        self.path = runtime.task_context_path(batch.gid, batch.id, task.tid)
-        self.run_dir = runtime.batch_dir(batch.gid, batch.id)
-        self.qa_path = runtime.qa_record_path(batch.gid, batch.id, task.tid)
+                 task: models.TaskList, attempt: Optional[int] = None,
+                 variables: Optional[dict] = None):
+        self.attempt = attempt if attempt is not None else getattr(batch, "attempt", None)
+        self.path = runtime.task_context_path(batch.gid, batch.id, task.tid, self.attempt)
+        self.run_dir = runtime.batch_dir(batch.gid, batch.id, self.attempt)
+        self.qa_path = runtime.qa_record_path(batch.gid, batch.id, task.tid, self.attempt)
         self.batch_id = batch.id
         self.sid = batch.sid
         self.gid = batch.gid
         self.tid = task.tid
 
         self.group_vars: dict = {}
-        if group.variables:
+        if variables is not None:
+            self.group_vars = variables
+        elif group.variables:
             try:
                 self.group_vars = json.loads(group.variables)
             except json.JSONDecodeError:
@@ -344,6 +430,7 @@ class _RunContext:
         self.data: dict[str, Any] = {
             "schema_version": runtime.SCHEMA_VERSION,
             "batch_id": batch.id,
+            "attempt": self.attempt,
             "sid": batch.sid,
             "gid": batch.gid,
             "tid": task.tid,
@@ -454,22 +541,27 @@ class _TaskLogger:
     任务结束时更新为最终状态（1=成功 / 2=失败）并写入结构化指标。
     """
 
-    def __init__(self, db: Session, batch: models.TaskBatch, task: models.TaskList):
+    def __init__(self, db: Session, batch: models.TaskBatch, task: models.TaskList,
+                 attempt: Optional[int] = None, secrets: Optional[set[str]] = None):
         self.db = db
         self.batch = batch
         self.task = task
+        self.attempt = attempt if attempt is not None else getattr(batch, "attempt", None)
+        self.secrets = secrets or set()
+        self.placeholder = get_config().security_mask_placeholder
         self.lines: list[str] = []
         self.result_id: Optional[int] = None
         # 创建执行中占位记录
         r = crud.create_result(
             db, batch.sid, batch.gid, task.tid, 3, "",
             batch_id=batch.id,
+            attempt=self.attempt,
             metrics=json.dumps({"metrics_version": 2, "stage": "running"}, ensure_ascii=False),
         )
         self.result_id = r.id
 
     def log(self, line: str = "") -> None:
-        self.lines.append(line)
+        self.lines.append(redact_text(line, self.secrets, self.placeholder))
         self._flush()
 
     def _flush(self) -> None:
@@ -502,55 +594,48 @@ def _execute_single_task(
     task: models.TaskList,
     cancel_event: threading.Event,
     ignore_dependencies: bool = False,
+    group_vars_override: Optional[dict] = None,
+    definition_source: str = "live",
+    definition_mismatch: bool = False,
 ) -> dict:
     """执行单个任务，返回执行详情。
 
     ignore_dependencies=True 时跳过依赖检查（批次详情页单独执行任务用）。
+    group_vars_override: 整批执行时传入 manifest 冻结的组变量；
+    definition_source: live=当前任务定义，manifest=批次冻结定义。
     """
     cfg = get_config()
     start_time = time.time()
+    max_script_timeout = cfg.agent_default_timeout
+
+    # 组变量：manifest 冻结值优先（整批重跑必须与批次创建时一致）
+    group_vars: dict = {}
+    if group_vars_override is not None:
+        group_vars = group_vars_override
+    elif group.variables:
+        try:
+            parsed = json.loads(group.variables)
+            group_vars = parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            group_vars = {}
+    secrets = collect_secret_values(group_vars)
+    expect_configured = bool((task.expect or "").strip())
 
     # 创建实时日志器（立即写入 result=3 占位记录）
-    logger = _TaskLogger(db, batch, task)
+    logger = _TaskLogger(
+        db, batch, task, attempt=getattr(batch, "attempt", None), secrets=secrets)
     logger.log(f"=== 任务 {task.tid} ({task.name}) 开始执行 ===")
     logger.log(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if definition_source == "manifest":
+        logger.log("任务定义: 批次创建时冻结的 manifest")
+    elif definition_mismatch:
+        logger.log("任务定义: 当前定义（与批次 manifest 不一致）")
 
     # 运行上下文：每阶段落盘，供工作空间脚本通过 ebaseline_sdk 读取
-    ctx = _RunContext(batch, group, task)
+    ctx = _RunContext(
+        batch, group, task, attempt=getattr(batch, "attempt", None),
+        variables=group_vars)
 
-    # 1. 检查依赖
-    logger.log("\n--- 阶段 1: 检查依赖 ---")
-    if ignore_dependencies:
-        ok, reason = True, ""
-        logger.log("依赖检查: 已跳过（单独执行，忽略依赖）")
-    else:
-        ok, reason = _check_dependencies(db, batch, task)
-        logger.log(f"依赖检查: {'通过' if ok else '失败: ' + reason}")
-    if not ok:
-        metrics = _base_metrics(start_time, stage="dependency", reason=reason)
-        logger.finish(2, metrics=metrics)
-        ctx.finish({
-            "ok": False,
-            "result": 2,
-            "result_detail": None,
-            "verdict": result_verdict(2, None, metrics),
-            "stage": "dependency",
-            "reason": reason,
-            "metrics": metrics,
-        })
-        return {
-            "success": False,
-            "result_detail": None,
-            "verdict": result_verdict(2, None, metrics),
-            "stage": "dependency",
-            "reason": reason,
-            "metrics": metrics,
-            "log": "\n".join(logger.lines),
-            "duration_sec": metrics["duration_sec"],
-        }
-
-    # 解析组变量（前置/Agent/校验/清理阶段都可能用到）
-    group_vars = ctx.group_vars
     # 将组变量拍平为环境变量注入脚本子进程（如 DB2_NODE_SRC_IP=192.168.34.8）
     script_env = _flatten_vars(group_vars) if group_vars else None
 
@@ -564,243 +649,213 @@ def _execute_single_task(
         env.update(ctx.script_env(stage))
         return env
 
-    # 2. 执行前置脚本
-    pre_result = None
-    if task.pre_script:
-        logger.log(f"\n--- 阶段 2: 前置脚本 ---\n命令: {task.pre_script}\n工作目录: {workspace}")
-        ctx.enter("pre_script")
-        pre_result = _run_script(task.pre_script, timeout=cfg.agent_default_timeout,
-                                 extra_env=stage_env("pre_script"), workspace=workspace)
-        logger.log(f"返回码: {pre_result['returncode']}")
-        if pre_result["stdout"]:
-            logger.log(f"stdout: {pre_result['stdout'][:2000]}")
-        if pre_result["stderr"]:
-            logger.log(f"stderr: {pre_result['stderr'][:2000]}")
-        ctx.set_script_result("pre_script", pre_result, "pre_script")
-        if not pre_result["success"]:
-            # 前置失败也要执行 clean
-            if task.clean:
-                logger.log("\n--- 阶段 C: 清理脚本（前置失败后执行）---")
-                ctx.enter("clean")
-                clean_result = _run_script(task.clean, extra_env=stage_env("clean"),
-                                           workspace=workspace)
-                logger.log(f"返回码: {clean_result['returncode']}")
-                ctx.set_script_result("clean", clean_result, "clean")
-            metrics = _base_metrics(
-                start_time,
-                stage="pre_script",
-                pre_script_returncode=pre_result["returncode"],
-            )
-            logger.finish(2, metrics=metrics)
-            ctx.finish({
-                "ok": False,
-                "result": 2,
-                "result_detail": None,
-                "verdict": result_verdict(2, None, metrics),
-                "stage": "pre_script",
-                "reason": f"前置脚本失败 (returncode={pre_result['returncode']})",
-                "metrics": metrics,
-            })
-            return {
-                "success": False,
-                "result_detail": None,
-                "verdict": result_verdict(2, None, metrics),
-                "stage": "pre_script",
-                "reason": f"前置脚本失败 (returncode={pre_result['returncode']})",
-                "metrics": metrics,
-                "log": "\n".join(logger.lines),
-                "duration_sec": metrics["duration_sec"],
-            }
+    clean_state: dict = {"done": False, "result": None}
 
-    # 3. 渲染 prompt
-    logger.log("\n--- 阶段 3: 渲染 prompt ---")
-    input_data: dict = {}
-    if task.input:
-        try:
-            input_data = json.loads(task.input)
-        except json.JSONDecodeError as e:
-            metrics = _base_metrics(start_time, stage="parse_input", reason=str(e))
-            logger.finish(2, result_detail=0, metrics=metrics)
-            ctx.finish({
-                "ok": False,
-                "result": 2,
-                "result_detail": 0,
-                "verdict": result_verdict(2, 0, metrics),
-                "stage": "parse_input",
-                "reason": f"input JSON 解析失败: {e}",
-                "metrics": metrics,
-            })
-            return {
-                "success": False,
-                "result_detail": 0,
-                "verdict": result_verdict(2, 0, metrics),
-                "stage": "parse_input",
-                "reason": f"input JSON 解析失败: {e}",
-                "metrics": metrics,
-                "log": "\n".join(logger.lines),
-                "duration_sec": metrics["duration_sec"],
-            }
-
-    prompt_template = input_data.get("prompt", "")
-    prompt = render_variables(prompt_template, group_vars)
-    logger.log(f"prompt: {prompt[:500]}{'...' if len(prompt) > 500 else ''}")
-    ctx.set_prompt(prompt)
-
-    conversation = input_data.get("conversation", [])
-    qa_missing = None
-    if conversation:
-        # 转换为 agent_client 的 qa_missing 格式
-        qa_missing = [
-            {"field": c.get("field", ""), "value": c.get("answer", "")}
-            for c in conversation if isinstance(c, dict)
-        ]
-
-    # 任务级超时：task.timeout > input.timeout（旧字段，兼容） > config.agent.default_timeout
-    agent_timeout = task.timeout
-    timeout_source = "任务设置"
-    if not agent_timeout or agent_timeout <= 0:
-        legacy_timeout = input_data.get("timeout")
-        if legacy_timeout is not None:
-            try:
-                legacy_timeout = int(legacy_timeout)
-            except (TypeError, ValueError):
-                legacy_timeout = None
-        if legacy_timeout and legacy_timeout > 0:
-            agent_timeout = legacy_timeout
-            timeout_source = "input.timeout（旧字段）"
-        else:
-            agent_timeout = cfg.agent_default_timeout
-            timeout_source = "全局默认"
-
-    # 4. 调用 Agent
-    logger.log(f"\n--- 阶段 4: 调用 Agent ---\n目标: {subject.ipaddr}:{subject.port}\n超时: {agent_timeout}s（{timeout_source}）")
-    agent_base_url = f"http://{subject.ipaddr}:{subject.port}"
-    agent_result = run_agent(
-        base_url=agent_base_url,
-        api_key=subject.secret,
-        input_text=prompt,
-        timeout=agent_timeout,
-        qa_missing=qa_missing,
-    )
-    logger.log(f"Agent 调用: {'成功' if agent_result.success else '失败'}")
-    logger.log(f"耗时: {agent_result.duration_sec}s, 轮次: {agent_result.rounds}, "
-               f"工具调用: {agent_result.tool_calls} 次")
-    if agent_result.first_token_ms is not None:
-        logger.log(f"首字延迟: {agent_result.first_token_ms}ms")
-    if agent_result.usage_seen:
-        logger.log(f"tokens: {agent_result.tokens}")
-    else:
-        logger.log("tokens: 缺失")
-    if agent_result.error:
-        logger.log(f"错误: {agent_result.error}")
-    logger.log(f"输出: {agent_result.output[:2000]}{'...' if len(agent_result.output) > 2000 else ''}")
-
-    # 落盘完整输出 + qa_record，供 expect/clean/下游任务脚本通过 SDK 读取
-    ctx.set_agent(agent_result)
-
-    agent_success = agent_result.success
-
-    # 5. 执行 expect 校验脚本
-    expect_results: list[dict] = []
-    expect_success = True
-    if task.expect:
-        logger.log(f"\n--- 阶段 5: 期望校验 ---\n命令: {task.expect}")
-        logger.log(f"通过 stdin 传入 Agent 回答（{len(agent_result.output)} 字符）")
-        ctx.enter("expect")
-        expect_result = _run_script(task.expect, timeout=cfg.agent_default_timeout,
-                                    extra_env=stage_env("expect"), workspace=workspace,
-                                    stdin_text=agent_result.output)
-        expect_results.append(expect_result)
-        logger.log(f"返回码: {expect_result['returncode']}")
-        if expect_result["stdout"]:
-            logger.log(f"stdout: {expect_result['stdout'][:2000]}")
-        if expect_result["stderr"]:
-            logger.log(f"stderr: {expect_result['stderr'][:2000]}")
-        expect_success = expect_result["success"]
-        logger.log(f"校验结果: {'通过' if expect_success else '失败'}")
-        ctx.set_script_result("expect", expect_result, "expect")
-
-    # 6. 执行 clean 脚本（总是执行）
-    clean_result = None
-    if task.clean:
+    def run_clean() -> Optional[dict]:
+        """执行清理脚本，保证最多执行一次；取消后仍执行（不继承取消信号）。"""
+        if clean_state["done"] or not task.clean:
+            return clean_state["result"]
+        clean_state["done"] = True
         logger.log(f"\n--- 阶段 6: 清理脚本 ---\n命令: {task.clean}")
         ctx.enter("clean")
-        clean_result = _run_script(task.clean, extra_env=stage_env("clean"), workspace=workspace)
-        logger.log(f"返回码: {clean_result['returncode']}")
-        ctx.set_script_result("clean", clean_result, "clean")
+        result = _run_script(
+            task.clean, timeout=max_script_timeout, extra_env=stage_env("clean"),
+            workspace=workspace, cancel_event=None)
+        logger.log(f"返回码: {result['returncode']}")
+        if result.get("stdout"):
+            logger.log(f"stdout: {result['stdout'][:2000]}")
+        if result.get("stderr"):
+            logger.log(f"stderr: {result['stderr'][:2000]}")
+        ctx.set_script_result("clean", result, "clean")
+        clean_state["result"] = result
+        return result
 
-    overall_success = agent_success and expect_success
+    def finish(result: int, detail: Optional[int], metrics: dict,
+               stage: str, reason: str = "") -> dict:
+        """统一收尾：执行 clean、写入结果/上下文并返回执行详情。"""
+        clean_result = run_clean()
+        if clean_result is None:
+            clean_success: Optional[bool] = True
+        elif clean_result.get("cancelled"):
+            clean_success = None
+            metrics["clean_cancelled"] = True
+        else:
+            clean_success = bool(clean_result.get("success"))
+        metrics["clean_success"] = clean_success
+        metrics["clean_returncode"] = (
+            clean_result.get("returncode") if clean_result else None)
 
-    # 细分结果状态（供 UI 区分显示）：
-    #   2 = 完全成功（Agent + 校验都通过）
-    #   1 = 校验成功但 Agent 调用失败（Agent 可能已干完活但响应超时/断开）
-    #   0 = 完全失败
-    if overall_success:
-        result_detail = 2
-    elif expect_success and not agent_success:
-        result_detail = 1
-    else:
-        result_detail = 0
+        # 清理失败不能被 PASS/UNVALIDATED/PARTIAL 掩盖；已经是 FAIL/SKIP 的
+        # 任务保留原阶段和原因，clean 失败仍通过 clean_success 指标记录。
+        if clean_success is False and (result == 1 or detail in (1, 2, 3)):
+            result, detail, stage = 2, 0, "clean"
+            reason = reason or "清理脚本失败"
 
-    status_text = {2: "成功", 1: "校验通过(Agent异常)", 0: "失败"}[result_detail]
-    logger.log(f"\n=== 任务 {task.tid} {status_text} (耗时 {round(time.time() - start_time, 1)}s) ===")
+        metrics["stage"] = stage
+        metrics.setdefault("expect_configured", expect_configured)
+        metrics["definition_source"] = definition_source
+        if definition_mismatch:
+            metrics["definition_mismatch"] = True
+        verdict = result_verdict(result, detail, metrics)
 
-    # 结构化指标：token 缺失时写 null，不按 0 计入均值
-    tokens = None
-    if agent_result.usage_seen:
-        tokens = {
-            "input": agent_result.tokens.get("input_tokens"),
-            "output": agent_result.tokens.get("output_tokens"),
-            "total": agent_result.tokens.get("total_tokens"),
+        detail_text = {2: "成功", 3: "未校验", 1: "校验通过(Agent异常)", 0: "失败"}
+        if detail in detail_text:
+            status_text = detail_text[detail]
+        else:
+            status_text = "跳过" if stage in ("dependency", "pre_script", "cancelled") else "失败"
+        logger.log(
+            f"\n=== 任务 {task.tid} {status_text} "
+            f"(耗时 {round(time.time() - start_time, 1)}s) ===")
+
+        logger.finish(result, result_detail=detail, metrics=metrics)
+        ctx_payload = {
+            "ok": verdict in ("PASS", "UNVALIDATED"),
+            "success": result == 1,
+            "result": result,
+            "result_detail": detail,
+            "verdict": verdict,
+            "stage": stage,
+            "reason": reason,
+            "agent_success": metrics.get("agent_success"),
+            "expect_configured": metrics.get("expect_configured"),
+            "expect_success": metrics.get("expect_success"),
+            "validated": metrics.get("validated"),
+            "clean_success": clean_success,
+            "metrics": metrics,
+            "duration_sec": metrics["duration_sec"],
         }
-        if not tokens.get("total"):
-            tokens["total"] = (tokens.get("input") or 0) + (tokens.get("output") or 0)
+        ctx.finish(ctx_payload)
+        return {
+            "success": result == 1,
+            "result": result,
+            "result_detail": detail,
+            "verdict": verdict,
+            "stage": stage,
+            "reason": reason,
+            "agent_success": metrics.get("agent_success"),
+            "expect_configured": metrics.get("expect_configured"),
+            "expect_success": metrics.get("expect_success"),
+            "validated": metrics.get("validated"),
+            "clean_success": clean_success,
+            "metrics": metrics,
+            "agent_result": state.get("agent_result"),
+            "pre_result": state.get("pre_result"),
+            "expect_results": state.get("expect_results") or [],
+            "clean_result": clean_result,
+            "log": "\n".join(logger.lines),
+            "duration_sec": round(time.time() - start_time, 1),
+        }
 
-    stage = "ok" if overall_success else ("agent" if not agent_success else "expect")
-    task_metrics = _base_metrics(
-        start_time,
-        stage=stage,
-        agent_duration_sec=agent_result.duration_sec,
-        rounds=agent_result.rounds,
-        tool_calls=agent_result.tool_calls,
-        tool_names=agent_result.tool_names,
-        first_token_ms=agent_result.first_token_ms,
-        tokens=tokens,
-        usage_seen=agent_result.usage_seen,
-        agent_success=agent_success,
-        expect_success=expect_success,
-        pre_script_ok=pre_result is None or pre_result.get("success"),
-        expect_returncode=(expect_results[0]["returncode"] if expect_results else None),
-        clean_returncode=(clean_result["returncode"] if clean_result else None),
-    )
+    state: dict = {}
 
-    # 更新最终状态（1=成功 2=失败）
-    logger.finish(
-        1 if result_detail == 2 else 2,
-        result_detail=result_detail,
-        metrics=task_metrics,
-    )
+    try:
+        # 1. 检查依赖
+        logger.log("\n--- 阶段 1: 检查依赖 ---")
+        if ignore_dependencies:
+            ok, reason = True, ""
+            logger.log("依赖检查: 已跳过（单独执行，忽略依赖）")
+        else:
+            ok, reason = _check_dependencies(
+                db, batch, task, attempt=getattr(batch, "attempt", 0))
+            logger.log(f"依赖检查: {'通过' if ok else '失败: ' + reason}")
+        if not ok:
+            metrics = _base_metrics(start_time, stage="dependency", reason=reason)
+            return finish(2, None, metrics, "dependency", reason)
 
-    # 运行上下文收尾：下游任务/事后排查可直接读该文件
-    ctx.finish({
-        "ok": result_detail == 2,
-        "result": 1 if result_detail == 2 else 2,
-        "result_detail": result_detail,
-        "verdict": result_verdict(1 if result_detail == 2 else 2, result_detail, task_metrics),
-        "agent_success": agent_success,
-        "expect_success": expect_success,
-        "metrics": task_metrics,
-        "duration_sec": task_metrics["duration_sec"],
-    })
+        if cancel_event.is_set():
+            metrics = _base_metrics(start_time, stage="cancelled", reason="用户取消")
+            return finish(2, None, metrics, "cancelled", "用户取消")
 
-    return {
-        "success": overall_success,
-        "result_detail": result_detail,
-        "verdict": result_verdict(1 if result_detail == 2 else 2, result_detail, task_metrics),
-        "agent_success": agent_success,
-        "expect_success": expect_success,
-        "metrics": task_metrics,
-        "agent_result": {
+        # 2. 执行前置脚本
+        pre_result = None
+        if task.pre_script:
+            logger.log(f"\n--- 阶段 2: 前置脚本 ---\n命令: {task.pre_script}\n工作目录: {workspace}")
+            ctx.enter("pre_script")
+            pre_result = _run_script(
+                task.pre_script, timeout=max_script_timeout,
+                extra_env=stage_env("pre_script"), workspace=workspace,
+                cancel_event=cancel_event)
+            state["pre_result"] = pre_result
+            logger.log(f"返回码: {pre_result['returncode']}")
+            if pre_result["stdout"]:
+                logger.log(f"stdout: {pre_result['stdout'][:2000]}")
+            if pre_result["stderr"]:
+                logger.log(f"stderr: {pre_result['stderr'][:2000]}")
+            ctx.set_script_result("pre_script", pre_result, "pre_script")
+            if pre_result.get("cancelled"):
+                metrics = _base_metrics(
+                    start_time, stage="cancelled", reason="用户取消",
+                    pre_script_returncode=pre_result["returncode"])
+                return finish(2, None, metrics, "cancelled", "用户取消")
+            if not pre_result["success"]:
+                metrics = _base_metrics(
+                    start_time,
+                    stage="pre_script",
+                    pre_script_returncode=pre_result["returncode"],
+                )
+                reason = f"前置脚本失败 (returncode={pre_result['returncode']})"
+                return finish(2, None, metrics, "pre_script", reason)
+
+        # 3. 渲染 prompt
+        logger.log("\n--- 阶段 3: 渲染 prompt ---")
+        input_data: dict = {}
+        if task.input:
+            try:
+                input_data = json.loads(task.input)
+            except json.JSONDecodeError as e:
+                metrics = _base_metrics(
+                    start_time, stage="parse_input", reason=str(e))
+                return finish(2, 0, metrics, "parse_input", f"input JSON 解析失败: {e}")
+
+        prompt_template = input_data.get("prompt", "")
+        prompt = render_variables(prompt_template, group_vars)
+        logger.log(f"prompt: {prompt[:500]}{'...' if len(prompt) > 500 else ''}")
+        ctx.set_prompt(prompt)
+
+        conversation = input_data.get("conversation", [])
+        qa_missing = None
+        if conversation:
+            # 转换为 agent_client 的 qa_missing 格式
+            qa_missing = [
+                {"field": c.get("field", ""), "value": c.get("answer", "")}
+                for c in conversation if isinstance(c, dict)
+            ]
+
+        # 任务级超时：task.timeout > input.timeout（旧字段，兼容） > config.agent.default_timeout
+        agent_timeout = task.timeout
+        timeout_source = "任务设置"
+        if not agent_timeout or agent_timeout <= 0:
+            legacy_timeout = input_data.get("timeout")
+            if legacy_timeout is not None:
+                try:
+                    legacy_timeout = int(legacy_timeout)
+                except (TypeError, ValueError):
+                    legacy_timeout = None
+            if legacy_timeout and legacy_timeout > 0:
+                agent_timeout = legacy_timeout
+                timeout_source = "input.timeout（旧字段）"
+            else:
+                agent_timeout = cfg.agent_default_timeout
+                timeout_source = "全局默认"
+
+        if cancel_event.is_set():
+            metrics = _base_metrics(start_time, stage="cancelled", reason="用户取消")
+            return finish(2, None, metrics, "cancelled", "用户取消")
+
+        # 4. 调用 Agent
+        logger.log(
+            f"\n--- 阶段 4: 调用 Agent ---\n目标: {subject.ipaddr}:{subject.port}\n"
+            f"超时: {agent_timeout}s（{timeout_source}）")
+        agent_base_url = f"http://{subject.ipaddr}:{subject.port}"
+        agent_result = run_agent(
+            base_url=agent_base_url,
+            api_key=subject.secret,
+            input_text=prompt,
+            timeout=agent_timeout,
+            qa_missing=qa_missing,
+            cancel_event=cancel_event,
+        )
+        state["agent_result"] = {
             "output": agent_result.output[:5000],
             "error": agent_result.error,
             "duration_sec": agent_result.duration_sec,
@@ -810,17 +865,138 @@ def _execute_single_task(
             "tool_calls": agent_result.tool_calls,
             "tool_names": agent_result.tool_names,
             "first_token_ms": agent_result.first_token_ms,
-        },
-        "pre_result": pre_result,
-        "expect_results": expect_results,
-        "clean_result": clean_result,
-        "log": "\n".join(logger.lines),
-        "duration_sec": round(time.time() - start_time, 1),
-    }
+            "cancelled": agent_result.cancelled,
+        }
+        logger.log(f"Agent 调用: {'成功' if agent_result.success else '失败'}")
+        logger.log(f"耗时: {agent_result.duration_sec}s, 轮次: {agent_result.rounds}, "
+                   f"工具调用: {agent_result.tool_calls} 次")
+        if agent_result.first_token_ms is not None:
+            logger.log(f"首字延迟: {agent_result.first_token_ms}ms")
+        if agent_result.usage_seen:
+            logger.log(f"tokens: {agent_result.tokens}")
+        else:
+            logger.log("tokens: 缺失")
+        if agent_result.error:
+            logger.log(f"错误: {agent_result.error}")
+        logger.log(
+            f"输出: {agent_result.output[:2000]}"
+            f"{'...' if len(agent_result.output) > 2000 else ''}")
+
+        # 落盘完整输出 + qa_record，供 expect/clean/下游任务脚本通过 SDK 读取
+        ctx.set_agent(agent_result)
+        agent_success = bool(agent_result.success)
+
+        if agent_result.cancelled or cancel_event.is_set():
+            metrics = _base_metrics(
+                start_time,
+                stage="cancelled",
+                reason="用户取消",
+                agent_duration_sec=agent_result.duration_sec,
+                rounds=agent_result.rounds,
+                tool_calls=agent_result.tool_calls,
+                agent_success=agent_success,
+                cancelled=True,
+            )
+            return finish(2, None, metrics, "cancelled", "用户取消")
+
+        # 5. 执行 expect 校验脚本
+        expect_results: list[dict] = []
+        expect_success: Optional[bool] = None
+        if expect_configured:
+            logger.log(f"\n--- 阶段 5: 期望校验 ---\n命令: {task.expect}")
+            logger.log(f"通过 stdin 传入 Agent 回答（{len(agent_result.output)} 字符）")
+            ctx.enter("expect")
+            expect_result = _run_script(
+                task.expect, timeout=max_script_timeout,
+                extra_env=stage_env("expect"), workspace=workspace,
+                stdin_text=agent_result.output, cancel_event=cancel_event)
+            expect_results.append(expect_result)
+            state["expect_results"] = expect_results
+            logger.log(f"返回码: {expect_result['returncode']}")
+            if expect_result["stdout"]:
+                logger.log(f"stdout: {expect_result['stdout'][:2000]}")
+            if expect_result["stderr"]:
+                logger.log(f"stderr: {expect_result['stderr'][:2000]}")
+            ctx.set_script_result("expect", expect_result, "expect")
+            if expect_result.get("cancelled"):
+                metrics = _base_metrics(
+                    start_time, stage="cancelled", reason="用户取消",
+                    agent_success=agent_success,
+                    expect_configured=True,
+                    expect_returncode=expect_result["returncode"])
+                return finish(2, None, metrics, "cancelled", "用户取消")
+            expect_success = bool(expect_result["success"])
+            logger.log(f"校验结果: {'通过' if expect_success else '失败'}")
+
+        # 6. 计算质量判定（clean 在外层 finish 中执行并可能覆盖）
+        validated = bool(expect_configured and expect_success)
+        if agent_success and (not expect_configured or expect_success):
+            result = 1
+            detail = 2 if expect_configured else 3
+        elif expect_configured and expect_success and not agent_success:
+            # 校验通过但 Agent 异常：保留证据，但下游依赖仍会阻断
+            result, detail = 2, 1
+        else:
+            result, detail = 2, 0
+
+        if detail == 2:
+            stage = "ok"
+        elif detail == 3:
+            stage = "unvalidated"
+        elif not agent_success:
+            stage = "agent"
+        else:
+            stage = "expect"
+
+        # 结构化指标：token 缺失时写 null，不按 0 计入均值
+        tokens = None
+        if agent_result.usage_seen:
+            tokens = {
+                "input": agent_result.tokens.get("input_tokens"),
+                "output": agent_result.tokens.get("output_tokens"),
+                "total": agent_result.tokens.get("total_tokens"),
+            }
+            if not tokens.get("total"):
+                tokens["total"] = (tokens.get("input") or 0) + (tokens.get("output") or 0)
+
+        task_metrics = _base_metrics(
+            start_time,
+            stage=stage,
+            agent_duration_sec=agent_result.duration_sec,
+            rounds=agent_result.rounds,
+            tool_calls=agent_result.tool_calls,
+            tool_names=agent_result.tool_names,
+            first_token_ms=agent_result.first_token_ms,
+            tokens=tokens,
+            usage_seen=agent_result.usage_seen,
+            agent_success=agent_success,
+            expect_configured=expect_configured,
+            expect_success=expect_success,
+            validated=validated,
+            pre_script_ok=pre_result is None or pre_result.get("success"),
+            expect_returncode=(expect_results[0]["returncode"] if expect_results else None),
+        )
+        return finish(result, detail, task_metrics, stage)
+
+    except Exception as e:
+        import traceback
+        err = f"{type(e).__name__}: {e}"
+        logger.log(f"执行异常: {err}\n{traceback.format_exc()}")
+        metrics = _base_metrics(start_time, stage="exception", error=err)
+        try:
+            return finish(2, 0, metrics, "exception", err)
+        except Exception:
+            logger.finish(2, result_detail=0, metrics=metrics)
+            raise
 
 
 def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
-    """同步执行批次（在线程池中运行）。"""
+    """同步执行批次（在线程池中运行）。
+
+    - 每次执行追加 attempt，历史结果不删除；
+    - 有 manifest 时使用冻结的任务/组变量；
+    - 取消后批次状态记为 5（已取消），未执行的下游任务保持未执行。
+    """
     db = _get_session_factory()()
     try:
         batch = crud.get_batch(db, batch_id)
@@ -832,17 +1008,38 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
             crud.update_batch_status(db, batch_id, 3)
             return
 
+        # 每次整批执行追加一个 attempt，重跑不再覆盖上一轮证据
+        attempt = crud.increment_batch_attempt(db, batch_id)
+        db.refresh(batch)
         crud.update_batch_status(db, batch_id, 1)  # 执行中
 
-        tasks = crud.list_tasks(db, gid=batch.gid)
-        sorted_tasks = _topological_sort(tasks)
+        manifest = manifest_mod.parse_manifest(batch.manifest)
+        manifest_ok = (
+            bool(manifest)
+            and manifest.get("manifest_version") == manifest_mod.MANIFEST_VERSION
+            and not manifest.get("error")
+        )
+        group_vars_override: Optional[dict] = None
+        definition_source = "live"
+        try:
+            if manifest_ok:
+                sorted_tasks = _topological_sort(manifest_mod.tasks_from_manifest(manifest))
+                group_vars_override = manifest_mod.group_variables_from_manifest(manifest)
+                definition_source = "manifest"
+            else:
+                sorted_tasks = _topological_sort(crud.list_tasks(db, gid=batch.gid))
+        except task_graph.DependencyError as exc:
+            logger.error("批次 %s 依赖图不合法，未执行: %s", batch_id, exc)
+            crud.update_batch_status(db, batch_id, 3)
+            return
 
-        # 清除该批次的旧结果与运行上下文（重跑场景）
-        crud.delete_results_by_batch(db, batch.id)
-        runtime.reset_batch(batch.gid, batch.id)
-        # 保留最近 20 个批次目录；同一组可能有其他批次在并行执行，不能删
+        # 只清理本轮上下文，上一轮 attempt 目录保留
+        runtime.reset_batch(batch.gid, batch.id, attempt)
+        runtime.prune_attempts(batch.gid, batch.id, protected={attempt})
+        # 保留最近 20 个批次目录；正在整批或单任务执行的批次不能删
         with _running_lock:
-            running_ids = set(_running_batches)
+            running_ids = set(_running_batches) | {
+                bid for bid, _tid in _running_tasks}
         runtime.prune_batches(batch.gid, protected=running_ids)
 
         total = len(sorted_tasks)
@@ -854,29 +1051,46 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
             if cancel_event.is_set():
                 break
             try:
-                detail = _execute_single_task(db, batch, subject, group, task, cancel_event)
+                detail = _execute_single_task(
+                    db, batch, subject, group, task, cancel_event,
+                    group_vars_override=group_vars_override,
+                    definition_source=definition_source,
+                )
             except Exception as e:
                 import traceback
                 err_log = f"执行异常: {e}\n" + traceback.format_exc()
-                # 异常场景也写一条失败记录
-                crud.create_result(
-                    db, sid=batch.sid, gid=batch.gid, tid=task.tid,
-                    result=2, process=err_log,
-                    batch_id=batch.id, result_detail=0,
-                    metrics=json.dumps({"metrics_version": 2, "stage": "exception"}, ensure_ascii=False),
-                )
+                metrics_text = json.dumps(
+                    {"metrics_version": 2, "stage": "exception", "error": str(e)},
+                    ensure_ascii=False)
+                # 优先复用执行器创建的执行中占位记录，避免留下 result=3 脏数据
+                stale = crud.get_batch_task_result(
+                    db, batch.id, task.tid, attempt=attempt)
+                if stale is not None and stale.result == 3:
+                    crud.update_result(
+                        db, stale.id, result=2, result_detail=0,
+                        metrics=metrics_text, process=err_log)
+                else:
+                    crud.create_result(
+                        db, sid=batch.sid, gid=batch.gid, tid=task.tid,
+                        result=2, process=err_log,
+                        batch_id=batch.id, result_detail=0,
+                        attempt=attempt, metrics=metrics_text,
+                    )
                 detail = {"success": False, "result_detail": 0, "verdict": "FAIL"}
 
             if detail.get("verdict") == "SKIP":
                 skipped_count += 1
-            elif detail.get("result_detail") == 2:
+            elif detail.get("result_detail") in (2, 3):
+                # UNVALIDATED（detail=3）执行成功但未校验，计为已执行成功
                 success_count += 1
             else:
                 failed_count += 1
                 # 失败任务的下游任务被跳过（因为依赖检查会失败）
 
-        # 更新批次状态
-        if failed_count == 0 and success_count == total:
+        # 更新批次状态；用户取消优先，避免把取消误报为部分成功
+        if cancel_event.is_set():
+            final_status = 5  # 已取消
+        elif failed_count == 0 and success_count == total:
             final_status = 2  # 已完成
         elif success_count > 0:
             final_status = 4  # 部分成功
@@ -889,17 +1103,21 @@ def _run_batch_sync(batch_id: int, cancel_event: threading.Event) -> None:
             _running_batches.pop(batch_id, None)
 
 
-def _recompute_batch_status(db: Session, batch_id: int) -> None:
+def _recompute_batch_status(db: Session, batch_id: int,
+                            attempt: Optional[int] = None) -> None:
     """按批次内各任务的最新结果重算批次状态。
 
     用于单独执行某个任务后同步批次状态（不删除其他任务的结果）。
+    指定 attempt 时只统计该轮，避免新旧轮次结果混合。
     """
     batch = crud.get_batch(db, batch_id)
     if batch is None:
         return
     tid_set = {t.tid for t in crud.list_tasks(db, gid=batch.gid)}
     by_tid: dict[int, models.TaskResult] = {}
-    for r in crud.list_results(db, batch_id=batch_id):
+    results = crud.list_results(
+        db, batch_id=batch_id, attempt=attempt if attempt else None)
+    for r in results:
         if r.tid in tid_set:
             by_tid.setdefault(r.tid, r)  # list_results 按 id 倒序，首条即最新
 
@@ -916,6 +1134,13 @@ def _recompute_batch_status(db: Session, batch_id: int) -> None:
     crud.update_batch_status(db, batch_id, status)
 
 
+def recompute_batch_status(db: Session, batch_id: int) -> None:
+    """对外暴露的批次状态重算（MCP 手工上报结果后调用）。"""
+    batch = crud.get_batch(db, batch_id)
+    attempt = getattr(batch, "attempt", None) if batch else None
+    _recompute_batch_status(db, batch_id, attempt=attempt)
+
+
 def _run_task_sync(batch_id: int, tid: int, force: bool,
                    cancel_event: threading.Event) -> None:
     """同步执行批次内的单个任务（在线程池中运行）。"""
@@ -929,20 +1154,45 @@ def _run_task_sync(batch_id: int, tid: int, force: bool,
         task = crud.get_task(db, tid)
         if subject is None or group is None or task is None or task.gid != batch.gid:
             return
+
+        # 单任务调试使用当前定义；与创建批次的 manifest 不一致时显式标记
+        manifest = manifest_mod.parse_manifest(batch.manifest)
+        frozen_signature = manifest_mod.manifest_task_signature(manifest, tid)
+        definition_mismatch = bool(
+            frozen_signature and frozen_signature != manifest_mod.task_signature(task))
+        if definition_mismatch:
+            logger.warning(
+                "批次 %s 单任务 %s 使用当前定义执行，与 manifest 冻结定义不一致",
+                batch_id, tid)
+
         try:
-            _execute_single_task(db, batch, subject, group, task, cancel_event,
-                                 ignore_dependencies=force)
+            _execute_single_task(
+                db, batch, subject, group, task, cancel_event,
+                ignore_dependencies=force,
+                definition_source="live",
+                definition_mismatch=definition_mismatch)
         except Exception as e:
             import traceback
             err_log = f"执行异常: {e}\n" + traceback.format_exc()
-            crud.create_result(
-                db, sid=batch.sid, gid=batch.gid, tid=task.tid,
-                result=2, process=err_log,
-                batch_id=batch.id, result_detail=0,
-                metrics=json.dumps({"metrics_version": 2, "stage": "exception"}, ensure_ascii=False),
-            )
+            metrics_text = json.dumps(
+                {"metrics_version": 2, "stage": "exception", "error": str(e)},
+                ensure_ascii=False)
+            stale = crud.get_batch_task_result(
+                db, batch.id, task.tid, attempt=getattr(batch, "attempt", None))
+            if stale is not None and stale.result == 3:
+                crud.update_result(
+                    db, stale.id, result=2, result_detail=0,
+                    metrics=metrics_text, process=err_log)
+            else:
+                crud.create_result(
+                    db, sid=batch.sid, gid=batch.gid, tid=task.tid,
+                    result=2, process=err_log,
+                    batch_id=batch.id, result_detail=0,
+                    attempt=getattr(batch, "attempt", None),
+                    metrics=metrics_text,
+                )
         finally:
-            _recompute_batch_status(db, batch_id)
+            _recompute_batch_status(db, batch_id, attempt=getattr(batch, "attempt", None))
     finally:
         db.close()
         with _running_lock:
@@ -996,13 +1246,68 @@ def start_batch_async(batch_id: int) -> bool:
 
 
 def cancel_batch(batch_id: int) -> bool:
-    """取消正在执行的批次。"""
+    """取消正在执行的批次（含该批次正在单独执行的任务）。"""
     with _running_lock:
+        events = []
         event = _running_batches.get(batch_id)
-        if event is None:
-            return False
-        event.set()
-        return True
+        if event is not None:
+            events.append(event)
+        events.extend(
+            ev for (bid, _tid), ev in _running_tasks.items() if bid == batch_id)
+    if not events:
+        return False
+    for ev in events:
+        ev.set()
+    return True
+
+
+def reconcile_interrupted(db: Optional[Session] = None) -> dict:
+    """启动时对账：把上次进程留下的“执行中”状态标记为中断。
+
+    内存中的运行登记/取消事件在重启后会丢失，若不做对账，批次会长期停在
+    “执行中”，也无法按正常流程重跑或取消。这里只处理残留状态，不删除数据。
+    """
+    own_session = db is None
+    session = db or _get_session_factory()()
+    try:
+        batches = (
+            session.query(models.TaskBatch)
+            .filter(models.TaskBatch.status == 1)
+            .all()
+        )
+        for batch in batches:
+            batch.status = 3  # 执行失败（中断）
+        if batches:
+            session.commit()
+
+        rows = (
+            session.query(models.TaskResult)
+            .filter(models.TaskResult.result == 3)
+            .all()
+        )
+        for row in rows:
+            try:
+                metrics = json.loads(row.metrics) if row.metrics else {}
+            except (TypeError, ValueError):
+                metrics = {}
+            if not isinstance(metrics, dict):
+                metrics = {}
+            metrics["stage"] = "interrupted"
+            metrics["error"] = "服务重启导致执行中断"
+            row.result = 2
+            row.result_detail = 0
+            row.metrics = json.dumps(metrics, ensure_ascii=False)
+            row.process = (row.process or "") + "\n=== 服务重启，执行中断，已标记为失败 ==="
+        if rows:
+            session.commit()
+        if batches or rows:
+            logger.warning(
+                "启动对账：%s 个批次、%s 条执行中结果已标记为中断",
+                len(batches), len(rows))
+        return {"batches": len(batches), "results": len(rows)}
+    finally:
+        if own_session:
+            session.close()
 
 
 def is_batch_running(batch_id: int) -> bool:

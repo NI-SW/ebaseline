@@ -6,7 +6,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from .. import crud, models, schemas
+from .. import crud, models, schemas, task_graph
 from ..auth import get_current_user, require_privilege
 from ..database import get_db
 
@@ -48,7 +48,10 @@ def create_task(
     """在组内创建任务（需 privilege >= 1）。"""
     if crud.get_task_group(db, gid) is None:
         raise HTTPException(status_code=404, detail="任务组不存在")
-    task = crud.create_task(db, gid, data)
+    try:
+        task = crud.create_task(db, gid, data)
+    except task_graph.DependencyError as exc:
+        raise HTTPException(status_code=400, detail="依赖不合法：" + "；".join(exc.issues))
     return _task_to_response(task)
 
 
@@ -86,7 +89,10 @@ def update_task(
     _: models.User = Depends(require_privilege(1)),
 ):
     """更新任务。"""
-    task = crud.update_task(db, tid, data)
+    try:
+        task = crud.update_task(db, tid, data)
+    except task_graph.DependencyError as exc:
+        raise HTTPException(status_code=400, detail="依赖不合法：" + "；".join(exc.issues))
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return _task_to_response(task)

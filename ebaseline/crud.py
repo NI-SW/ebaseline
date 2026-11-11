@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import json
+import logging
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from . import models, schemas
+from . import manifest as manifest_mod
+from . import models, schemas, task_graph
+from .config import get_config
+from .security import merge_masked_values
+
+logger = logging.getLogger(__name__)
 
 
 # ── Task Group ─────────────────────────────────────────────────
@@ -33,16 +40,36 @@ def list_task_groups(db: Session, skip: int = 0, limit: int = 100) -> list[model
     return db.query(models.TaskGroup).offset(skip).limit(limit).all()
 
 
+def _merge_group_variables(old_raw: str | None, new_vars: dict | None) -> str | None:
+    """更新组变量时用旧值回填脱敏占位符。"""
+    if new_vars is None:
+        return None
+    old_vars: dict = {}
+    if old_raw:
+        try:
+            parsed = json.loads(old_raw)
+            if isinstance(parsed, dict):
+                old_vars = parsed
+        except (TypeError, ValueError):
+            old_vars = {}
+    cfg = get_config()
+    merged = merge_masked_values(
+        old_vars, new_vars, cfg.security_mask_placeholder)
+    return json.dumps(merged, ensure_ascii=False)
+
+
 def update_task_group(db: Session, gid: int, data: schemas.TaskGroupUpdate) -> models.TaskGroup | None:
     group = get_task_group(db, gid)
     if group is None:
         return None
+    fields = data.model_fields_set
     if data.name is not None:
         group.name = data.name
-    if data.description is not None:
+    # description/variables 显式传 null 时清空，而不是忽略
+    if "description" in fields:
         group.description = data.description
-    if data.variables is not None:
-        group.variables = json.dumps(data.variables, ensure_ascii=False)
+    if "variables" in fields:
+        group.variables = _merge_group_variables(group.variables, data.variables)
     if data.python_version is not None:
         group.python_version = data.python_version
     db.commit()
@@ -79,7 +106,7 @@ def _next_tid(db: Session, gid: int) -> int:
 # ── Task ───────────────────────────────────────────────────────
 def create_task(db: Session, gid: int, data: schemas.TaskCreate) -> models.TaskList:
     tid = data.tid if data.tid is not None else _next_tid(db, gid)
-    depends = ",".join(map(str, data.depends)) if data.depends else None
+    depends = task_graph.depends_to_str(data.depends)
     input_str = json.dumps(data.input, ensure_ascii=False) if data.input else None
     task = models.TaskList(
         tid=tid,
@@ -93,6 +120,11 @@ def create_task(db: Session, gid: int, data: schemas.TaskCreate) -> models.TaskL
         expect=data.expect,
         clean=data.clean,
     )
+    # 保存前校验依赖：缺失/跨组/自依赖/环路直接拒绝，不再静默执行
+    existing = db.query(models.TaskList).filter(models.TaskList.gid == gid).all()
+    if any(t.tid == tid for t in existing):
+        raise task_graph.DependencyError([f"任务 tid {tid} 已存在"])
+    task_graph.ensure_valid(existing + [task])
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -114,22 +146,30 @@ def update_task(db: Session, tid: int, data: schemas.TaskUpdate) -> models.TaskL
     task = get_task(db, tid)
     if task is None:
         return None
+    fields = data.model_fields_set
     if data.name is not None:
         task.name = data.name
-    if data.description is not None:
+    # 显式 null 表示清空；未提供则保持原值
+    if "description" in fields:
         task.description = data.description
-    if data.depends is not None:
-        task.depends = ",".join(map(str, data.depends)) if data.depends else None
-    if data.pre_script is not None:
+    if "depends" in fields:
+        task.depends = task_graph.depends_to_str(data.depends)
+        existing = (
+            db.query(models.TaskList)
+            .filter(models.TaskList.gid == task.gid, models.TaskList.tid != task.tid)
+            .all()
+        )
+        task_graph.ensure_valid(existing + [task])
+    if "pre_script" in fields:
         task.pre_script = data.pre_script
-    if data.input is not None:
-        task.input = json.dumps(data.input, ensure_ascii=False)
+    if "input" in fields:
+        task.input = json.dumps(data.input, ensure_ascii=False) if data.input else None
     # 显式传 null 时清除任务级超时，恢复全局默认
-    if "timeout" in data.model_fields_set:
+    if "timeout" in fields:
         task.timeout = data.timeout
-    if data.expect is not None:
+    if "expect" in fields:
         task.expect = data.expect
-    if data.clean is not None:
+    if "clean" in fields:
         task.clean = data.clean
     db.commit()
     db.refresh(task)
@@ -197,8 +237,28 @@ def delete_subject(db: Session, sid: int) -> bool:
 
 
 # ── Batch ──────────────────────────────────────────────────────
-def create_batch(db: Session, sid: int, gid: int) -> models.TaskBatch:
-    batch = models.TaskBatch(sid=sid, gid=gid, status=0)
+def create_batch(db: Session, sid: int, gid: int,
+                 manifest: dict | None = None) -> models.TaskBatch:
+    """创建批次并冻结任务/变量/脚本 hash 清单。"""
+    manifest_data = manifest
+    if manifest_data is None:
+        try:
+            manifest_data = manifest_mod.build_manifest(db, sid, gid)
+        except Exception as exc:  # 清单失败不应阻塞创建，但必须可追溯
+            logger.warning("构建批次清单失败: %s", exc, exc_info=True)
+            manifest_data = {
+                "manifest_version": 0,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "error": f"{type(exc).__name__}: {exc}",
+                "tasks": [],
+            }
+    batch = models.TaskBatch(
+        sid=sid,
+        gid=gid,
+        status=0,
+        attempt=0,
+        manifest=json.dumps(manifest_data, ensure_ascii=False),
+    )
     db.add(batch)
     db.commit()
     db.refresh(batch)
@@ -221,6 +281,17 @@ def update_batch_status(db: Session, batch_id: int, status: int) -> models.TaskB
     db.commit()
     db.refresh(batch)
     return batch
+
+
+def increment_batch_attempt(db: Session, batch_id: int) -> int:
+    """整批重跑开始前递增 attempt，返回本次轮次。"""
+    batch = get_batch(db, batch_id)
+    if batch is None:
+        return 0
+    batch.attempt = int(batch.attempt or 0) + 1
+    db.commit()
+    db.refresh(batch)
+    return int(batch.attempt)
 
 
 def delete_batch(db: Session, batch_id: int) -> bool:
@@ -247,6 +318,7 @@ def create_result(
     batch_id: int | None = None,
     result_detail: int | None = None,
     metrics: str | None = None,
+    attempt: int | None = None,
 ) -> models.TaskResult:
     r = models.TaskResult(
         batch_id=batch_id,
@@ -255,6 +327,7 @@ def create_result(
         tid=tid,
         result=result,
         result_detail=result_detail,
+        attempt=attempt,
         metrics=metrics,
         process=process,
     )
@@ -300,10 +373,20 @@ def list_results(
     tid: int | None = None,
     result: int | None = None,
     batch_id: int | None = None,
+    attempt: int | None = None,
 ) -> list[models.TaskResult]:
     q = db.query(models.TaskResult)
     if batch_id is not None:
         q = q.filter(models.TaskResult.batch_id == batch_id)
+    if attempt is not None:
+        if attempt == 0:
+            # attempt 0 兼容没有该字段的旧结果（NULL）
+            q = q.filter(or_(
+                models.TaskResult.attempt == 0,
+                models.TaskResult.attempt.is_(None),
+            ))
+        else:
+            q = q.filter(models.TaskResult.attempt == attempt)
     if sid is not None:
         q = q.filter(models.TaskResult.sid == sid)
     if gid is not None:
@@ -367,14 +450,34 @@ def get_task_result(
     return q.order_by(models.TaskResult.id.desc()).first()
 
 
-def get_batch_task_result(db: Session, batch_id: int, tid: int) -> models.TaskResult | None:
-    """获取批次内某任务的最新结果。"""
-    return (
-        db.query(models.TaskResult)
+def get_batch_task_result(db: Session, batch_id: int, tid: int,
+                          attempt: int | None = None) -> models.TaskResult | None:
+    """获取批次内某任务的最新结果；指定 attempt 时只看该轮。"""
+    q = db.query(models.TaskResult).filter(
+        models.TaskResult.batch_id == batch_id,
+        models.TaskResult.tid == tid,
+    )
+    if attempt is not None:
+        if attempt == 0:
+            q = q.filter(or_(
+                models.TaskResult.attempt == 0,
+                models.TaskResult.attempt.is_(None),
+            ))
+        else:
+            q = q.filter(models.TaskResult.attempt == attempt)
+    return q.order_by(models.TaskResult.id.desc()).first()
+
+
+def list_batch_attempts(db: Session, batch_id: int) -> list[int]:
+    """批次实际产生过结果的 attempt 列表（升序）。"""
+    rows = (
+        db.query(models.TaskResult.attempt)
         .filter(
             models.TaskResult.batch_id == batch_id,
-            models.TaskResult.tid == tid,
+            models.TaskResult.attempt.isnot(None),
         )
-        .order_by(models.TaskResult.id.desc())
-        .first()
+        .distinct()
+        .order_by(models.TaskResult.attempt.asc())
+        .all()
     )
+    return [int(r[0]) for r in rows if r[0] is not None]

@@ -2,8 +2,10 @@
 
 目录布局（在项目根目录 runtime/ 下，不暴露给工作空间文件 API）：
 
-    runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.json   每任务一份上下文
-    runtime/ebase_runs/group_<gid>/batch_<bid>/<tid>.qa.json  QA 闭环记录（有则写）
+    runtime/ebase_runs/group_<gid>/batch_<bid>/attempt_<n>/<tid>.json    每任务一份上下文
+    runtime/ebase_runs/group_<gid>/batch_<bid>/attempt_<n>/<tid>.qa.json QA 闭环记录（有则写）
+
+旧版目录（无 attempt 层）仍然可读，新执行一律写入 attempt_<n>/。
 
 同一批次内任务串行执行，不同批次目录隔离，因此无需加锁；
 写入采用 tmp + os.replace，读取方（脚本）不会看到半截 JSON。
@@ -25,23 +27,33 @@ SCHEMA_VERSION = 1
 # 单段文本上限（Agent 输出可能很大）：超出部分截断并打标记
 MAX_TEXT_CHARS = 4_000_000
 
-# 每组保留的批次目录数（超出按修改时间淘汰）
+# 每组保留的批次目录数、每批次保留的 attempt 目录数（超出按修改时间淘汰）
 KEEP_BATCH_DIRS = 20
+KEEP_ATTEMPTS = 20
 
 
-def batch_dir(gid: int, batch_id: int) -> Path:
-    """批次上下文目录。"""
-    return RUNTIME_ROOT / "ebase_runs" / f"group_{gid}" / f"batch_{batch_id}"
+def batch_dir(gid: int, batch_id: int, attempt: Optional[int] = None) -> Path:
+    """批次上下文目录。
+
+    attempt 为 None 时返回旧版批次目录（兼容旧调用/旧数据）；
+    指定 attempt 时返回 batch_<bid>/attempt_<n>/，重跑不再覆盖上一轮。
+    """
+    base = RUNTIME_ROOT / "ebase_runs" / f"group_{gid}" / f"batch_{batch_id}"
+    if attempt is None:
+        return base
+    return base / f"attempt_{int(attempt)}"
 
 
-def task_context_path(gid: int, batch_id: int, tid: int) -> Path:
+def task_context_path(gid: int, batch_id: int, tid: int,
+                      attempt: Optional[int] = None) -> Path:
     """单任务上下文文件路径。"""
-    return batch_dir(gid, batch_id) / f"{tid}.json"
+    return batch_dir(gid, batch_id, attempt) / f"{tid}.json"
 
 
-def qa_record_path(gid: int, batch_id: int, tid: int) -> Path:
+def qa_record_path(gid: int, batch_id: int, tid: int,
+                   attempt: Optional[int] = None) -> Path:
     """QA 闭环记录文件路径。"""
-    return batch_dir(gid, batch_id) / f"{tid}.qa.json"
+    return batch_dir(gid, batch_id, attempt) / f"{tid}.qa.json"
 
 
 def cap_text(text: Optional[str], limit: int = MAX_TEXT_CHARS) -> tuple[str, bool]:
@@ -70,9 +82,30 @@ def write_json(path: Path, data: Any) -> Path:
     return write_context(path, data)
 
 
-def reset_batch(gid: int, batch_id: int) -> None:
-    """清空某批次的上下文目录（重跑前调用）。"""
-    shutil.rmtree(batch_dir(gid, batch_id), ignore_errors=True)
+def reset_batch(gid: int, batch_id: int, attempt: Optional[int] = None) -> None:
+    """清空某批次（或某轮 attempt）的上下文目录。
+
+    指定 attempt 时只清空该轮目录；上一轮的上下文保留，供历史排查。
+    """
+    shutil.rmtree(batch_dir(gid, batch_id, attempt), ignore_errors=True)
+
+
+def prune_attempts(gid: int, batch_id: int, keep: int = KEEP_ATTEMPTS,
+                   protected: Optional[set[int]] = None) -> None:
+    """每批次保留最近 keep 个 attempt 目录。"""
+    base = batch_dir(gid, batch_id)
+    if not base.is_dir():
+        return
+    protected_names = {f"attempt_{n}" for n in (protected or ())}
+    dirs = [
+        d for d in base.iterdir()
+        if d.is_dir() and d.name.startswith("attempt_") and d.name not in protected_names
+    ]
+    if len(dirs) <= keep:
+        return
+    dirs.sort(key=_last_activity, reverse=True)
+    for d in dirs[keep:]:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def purge_group(gid: int) -> None:
@@ -88,7 +121,8 @@ def _last_activity(directory: Path) -> float:
     """
     latest = directory.stat().st_mtime
     try:
-        for p in directory.iterdir():
+        # attempt 目录内的上下文文件是持续改写的，必须递归查看文件 mtime
+        for p in directory.rglob("*"):
             try:
                 latest = max(latest, p.stat().st_mtime)
             except OSError:

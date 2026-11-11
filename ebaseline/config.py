@@ -100,6 +100,71 @@ class Config:
     def mcp_path(self) -> str:
         return self._raw.get("mcp", {}).get("path", "/mcp")
 
+    @property
+    def mcp_auth_token(self) -> str:
+        """MCP 管理员 token；环境变量优先。"""
+        return (
+            os.environ.get("EBASE_MCP_TOKEN")
+            or self._raw.get("mcp", {}).get("auth_token")
+            or ""
+        ).strip()
+
+    @property
+    def mcp_readonly_token(self) -> str:
+        """MCP 只读 token；为空表示不启用只读角色。"""
+        return (
+            os.environ.get("EBASE_MCP_READONLY_TOKEN")
+            or self._raw.get("mcp", {}).get("readonly_token")
+            or ""
+        ).strip()
+
+    @property
+    def mcp_token_file(self) -> Path:
+        """自动生成 token 的持久化位置（相对配置文件目录）。"""
+        p = Path(self._raw.get("mcp", {}).get("token_file", "runtime/mcp_token"))
+        if not p.is_absolute():
+            p = self.path.parent / p
+        return p
+
+    @property
+    def mcp_allow_unauthenticated(self) -> bool:
+        return bool(self._raw.get("mcp", {}).get("allow_unauthenticated", False))
+
+    @property
+    def mcp_allowed_hosts(self) -> list[str]:
+        return list(self._raw.get("mcp", {}).get("allowed_hosts", []) or [])
+
+    @property
+    def mcp_allowed_origins(self) -> list[str]:
+        return list(self._raw.get("mcp", {}).get("allowed_origins", []) or [])
+
+    # ── workspace ───────────────────────────────────────────────
+    @property
+    def workspace_terminal_enabled(self) -> bool:
+        return bool(self._raw.get("workspace", {}).get("terminal_enabled", True))
+
+    @property
+    def workspace_terminal_min_privilege(self) -> int:
+        return int(self._raw.get("workspace", {}).get("terminal_min_privilege", 1))
+
+    @property
+    def workspace_allow_root_execution(self) -> bool:
+        """服务以 root 运行时是否允许打开主机 shell。
+
+        默认 false：root 服务下的 Web 终端会继承 root 身份，必须先显式放行
+        或改用非 root 账号/隔离容器运行。
+        """
+        return bool(self._raw.get("workspace", {}).get("allow_root_execution", False))
+
+    # ── security ────────────────────────────────────────────────
+    @property
+    def security_mask_group_secrets(self) -> bool:
+        return bool(self._raw.get("security", {}).get("mask_group_secrets", True))
+
+    @property
+    def security_mask_placeholder(self) -> str:
+        return str(self._raw.get("security", {}).get("mask_placeholder", "********"))
+
     # ── auth ────────────────────────────────────────────────────
     @property
     def auth_secret_key(self) -> str:
@@ -107,6 +172,24 @@ class Config:
         if not key:
             raise ConfigError("auth.secret_key 未配置（也可设 EBASE_SECRET_KEY 环境变量）")
         return key
+
+    @property
+    def auth_allow_register(self) -> bool:
+        return bool(self._raw.get("auth", {}).get("allow_register", True))
+
+    @property
+    def auth_allow_init_admin(self) -> bool:
+        """是否允许通过公开接口创建初始 admin（默认关闭）。"""
+        return bool(self._raw.get("auth", {}).get("allow_init_admin", False))
+
+    @property
+    def auth_initial_admin_password(self) -> str:
+        """首次创建 admin 时的密码；为空则随机生成。"""
+        return (
+            os.environ.get("EBASE_ADMIN_PASSWORD")
+            or self._raw.get("auth", {}).get("initial_admin_password")
+            or ""
+        )
 
     @property
     def auth_algorithm(self) -> str:

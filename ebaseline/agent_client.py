@@ -62,6 +62,7 @@ class AgentResult:
     tool_names: list[str] = field(default_factory=list)
     first_token_ms: Optional[int] = None  # 首字延迟（发起请求 → 首个文本增量）
     qa_record: Optional[dict] = None
+    cancelled: bool = False           # 是否被用户取消（用于区别于失败/超时）
 
 
 def _asks_for_confirmation(text: str) -> bool:
@@ -191,10 +192,12 @@ def _run_agent_once(
     payload: dict,
     deadline: float,
     origin: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """单轮 Agent 调用：POST /v1/responses，处理 SSE 流。
 
     origin 为整个任务开始时间；首字延迟按它计算，避免多轮时被低估。
+    cancel_event 置位时中断流并返回 error="任务已取消"。
     """
     origin = origin or time.time()
     result = {
@@ -240,6 +243,26 @@ def _run_agent_once(
             result["first_token_ms"] = int((first_delta_at - origin) * 1000)
         return result
 
+    if cancel_event is not None and cancel_event.is_set():
+        result["error"] = "任务已取消"
+        return _finalize()
+
+    # 流可能长时间没有新行：用独立监听线程在取消时直接打断 socket
+    stop_watch = threading.Event()
+    watcher: Optional[threading.Thread] = None
+    if cancel_event is not None:
+        def _watch_cancel() -> None:
+            while not stop_watch.is_set() and not cancel_event.is_set():
+                cancel_event.wait(0.5)
+            if cancel_event.is_set() and not stop_watch.is_set():
+                result["error"] = "任务已取消"
+                resp = resp_holder.get("resp")
+                if resp is not None:
+                    _abort_response(resp)
+
+        watcher = threading.Thread(target=_watch_cancel, daemon=True)
+        watcher.start()
+
     timer = threading.Timer(max(1, deadline - time.time()), _on_timeout)
     timer.start()
     try:
@@ -255,6 +278,10 @@ def _run_agent_once(
                 result["error"] = f"HTTP {resp.status_code}: {resp.text[:500]}"
                 return _finalize()
             for line in resp.iter_lines(decode_unicode=True):
+                if cancel_event is not None and cancel_event.is_set():
+                    result["error"] = "任务已取消"
+                    _abort_response(resp)
+                    return _finalize()
                 if result["error"]:
                     return _finalize()
                 if not line or not line.startswith("data:"):
@@ -295,6 +322,7 @@ def _run_agent_once(
         if not result["error"]:
             result["error"] = f"Agent 调用异常: {e}"
     finally:
+        stop_watch.set()
         timer.cancel()
 
     return _finalize()
@@ -306,6 +334,7 @@ def run_agent(
     input_text: str,
     timeout: Optional[int] = None,
     qa_missing: Optional[list[dict]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> AgentResult:
     """调用 Agent API 执行任务。
 
@@ -367,8 +396,29 @@ def run_agent(
             tokens["total_tokens"] = (tokens.get("input_tokens") or 0) + (tokens.get("output_tokens") or 0)
         return tokens
 
+    def _cancelled_result() -> AgentResult:
+        return AgentResult(
+            success=False,
+            output="".join(text_parts),
+            error="任务已取消",
+            returncode=-2,
+            duration_sec=round(time.time() - start_time, 1),
+            rounds=follow_ups + 1,
+            tokens=_token_snapshot(),
+            usage_seen=usage_seen,
+            tool_calls=tool_calls_total,
+            tool_names=tool_names,
+            first_token_ms=first_token_ms,
+            qa_record=qa_record if qa_mode else None,
+            cancelled=True,
+        )
+
     while True:
-        result = _run_agent_once(url, headers, payload, deadline, start_time)
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result()
+
+        result = _run_agent_once(
+            url, headers, payload, deadline, start_time, cancel_event=cancel_event)
         text_parts.append(result["text"])
         if result.get("usage_seen"):
             usage_seen = True
@@ -382,6 +432,9 @@ def run_agent(
                               else min(first_token_ms, result["first_token_ms"]))
 
         if result["error"]:
+            if (cancel_event is not None and cancel_event.is_set()) or \
+                    result.get("error") == "任务已取消":
+                return _cancelled_result()
             if follow_ups > 0 and text_parts[0]:
                 # 追加轮失败但首轮成功，保留已有结果
                 break
@@ -399,6 +452,9 @@ def run_agent(
                 first_token_ms=first_token_ms,
                 qa_record=qa_record if qa_mode else None,
             )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result()
 
         final_payload = result["final_payload"]
         response_obj = final_payload.get("response") if final_payload else None

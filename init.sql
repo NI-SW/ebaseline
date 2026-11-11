@@ -8,7 +8,12 @@ id int not null auto_increment primary key,
 username char(32) not null unique,	    -- 用户名
 password varchar(128) not null,	        -- 密码(加密后的)
 email varchar(128),                     -- 邮箱
-privilege int not null default 0		-- 权限等级，0为普通用户，1为管理员, 2为超级管理员
+privilege int not null default 0,		-- 权限等级，0为普通用户，1为管理员, 2为超级管理员
+api_key_hash char(64),                  -- 个人 MCP API Key 的 SHA-256（不存明文）
+api_key_prefix varchar(16),             -- Key 前缀，仅用于页面展示
+api_key_created_at timestamp null,      -- Key 生成时间
+api_key_last_used_at timestamp null,    -- Key 最近使用时间
+index ix_users_api_key_hash (api_key_hash)
 );
 /*
 0具备测试权限，
@@ -87,7 +92,9 @@ create table if not exists ebase.task_batch (
 id int not null auto_increment primary key,		-- 批次id
 sid int not null,                               -- subject id
 gid int not null,                               -- group id
-status int not null default 0,                  -- 批次状态，0为未执行，1为执行中，2为已完成，3为执行失败, 4为部分成功
+status int not null default 0,                  -- 批次状态，0未执行，1执行中，2已完成，3执行失败，4部分成功，5已取消
+attempt int not null default 0,                 -- 已执行的轮次（每次整批重跑 +1，历史结果保留）
+manifest TEXT,                                  -- 创建时冻结的任务/变量/脚本hash清单（JSON）
 create_time timestamp default current_timestamp	-- 批次创建时间
 );
 /*
@@ -95,7 +102,7 @@ create_time timestamp default current_timestamp	-- 批次创建时间
 用户可以选择某个批次的任务执行下列操作：
 1. 执行批次任务：系统会根据该批次的任务列表，依次执行每个任务，并将执行结果存储在task_result表中。
 2. 查看批次任务执行结果：用户可以通过查询task_result表来查看某个批次的任务执行结果，并根据结果进行相应的处理和分析。
-3. 重新执行批次任务：用户可以选择重新执行某个批次的任务，系统会根据该批次的任务列表，依次执行每个任务，并将执行结果存储在task_result表中，覆盖原有的执行结果。
+3. 重新执行批次任务：用户可以选择重新执行某个批次的任务，系统会使用批次创建时冻结的 manifest，依次执行每个任务，并把新结果追加到 task_result（attempt 递增），保留历史轮次。
 4. 删除批次任务：用户可以选择删除某个批次的任务，系统会将该批次的任务从task_batch表中删除，并将该批次的任务执行结果从task_result表中删除。
 5. 导出批次任务执行结果：用户可以选择导出某个批次的任务执行结果，系统会将该批次的任务执行结果导出为CSV文件，供用户下载和分析。
 6. 修改批次任务：用户可以选择修改某个批次的任务，系统会根据用户的修改，更新该批次的任务列表，并将该批次的任务执行结果从task_result表中删除。
@@ -110,7 +117,8 @@ sid int not null,					            -- subject id
 gid int not null,					            -- group id
 tid int not null,					            -- task id
 result int not null default 0,                  -- 执行状态，0为未执行，1为执行成功，2为执行失败，3为执行中
-result_detail int,                              -- 细分结果，2为完全成功，1为校验通过但Agent异常，0为失败
+result_detail int,                              -- 细分结果，3为执行成功但未配置校验，2为完全成功(已校验通过)，1为校验通过但Agent异常，0为失败
+attempt int,                                    -- 所属批次执行轮次（旧数据为 NULL）
 metrics TEXT,                                   -- 结构化指标JSON：耗时/token/轮次/工具调用/阶段等
 process TEXT,                                   -- 执行结果信息，包含任务执行的详细日志和输出结果
 create_time timestamp default current_timestamp	-- 执行时间

@@ -31,6 +31,11 @@ class UserResponse(BaseModel):
     username: str
     email: Optional[str]
     privilege: int
+    # 个人 MCP API Key 状态：只暴露前缀/时间，绝不返回哈希或明文
+    has_api_key: bool = False
+    api_key_prefix: Optional[str] = None
+    api_key_created_at: Optional[datetime] = None
+    api_key_last_used_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -38,6 +43,25 @@ class UserResponse(BaseModel):
 
 class UserPrivilegeUpdate(BaseModel):
     privilege: int = Field(..., ge=0, le=2)
+
+
+class ProfileUpdate(BaseModel):
+    """当前用户修改自己的用户名/邮箱，必须验证当前密码。"""
+    username: Optional[str] = Field(None, min_length=1, max_length=32)
+    email: Optional[str] = Field(None, max_length=128)
+    current_password: str = Field(..., min_length=1, max_length=128)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
+class ApiKeyResponse(BaseModel):
+    api_key: str          # 明文，仅本次响应返回
+    prefix: str
+    created_at: datetime
+    message: str = "API Key 已生成，请立即保存；关闭弹窗后无法再次查看"
 
 
 # ── Task Group ─────────────────────────────────────────────────
@@ -146,6 +170,7 @@ class BatchResponse(BaseModel):
     sid: int
     gid: int
     status: int
+    attempt: int = 0  # 已执行的轮次（每次整批重跑 +1）
     create_time: datetime
     metrics: Optional[dict[str, Any]] = None
 
@@ -158,6 +183,9 @@ class BatchDetailResponse(BatchResponse):
     group_name: Optional[str] = None
     tasks: Optional[list[dict[str, Any]]] = None  # 包含每个任务的执行状态与指标
     running_task_tid: Optional[int] = None  # 正在单独执行的任务 tid（服务端实时状态）
+    manifest_summary: Optional[dict[str, Any]] = None  # 冻结清单摘要（变量已脱敏）
+    available_attempts: Optional[list[int]] = None
+    viewing_attempt: Optional[int] = None
 
 
 # ── Result ─────────────────────────────────────────────────────
@@ -169,6 +197,7 @@ class ResultResponse(BaseModel):
     tid: int
     result: int
     result_detail: Optional[int] = None
+    attempt: Optional[int] = None
     metrics: Optional[dict[str, Any]] = None
     process: Optional[str]
     create_time: datetime

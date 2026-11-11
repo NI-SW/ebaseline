@@ -65,9 +65,14 @@ runtime/
 └── ebase_runs/
     └── group_<gid>/
         └── batch_<bid>/
-            ├── <tid>.json        # 任务运行上下文
-            └── <tid>.qa.json     # QA 闭环记录（仅当任务配置了 conversation）
+            └── attempt_<n>/
+                ├── <tid>.json        # 任务运行上下文
+                └── <tid>.qa.json     # QA 闭环记录（仅当任务配置了 conversation）
 ```
+
+旧版目录（没有 `attempt_<n>/` 层）仍可读取；新执行一律写入 attempt 目录，
+因此整批重跑不会覆盖上一轮的上下文。`EBASE_RUN_DIR` 会指向当前 attempt 目录，
+脚本/SDK 不需要感知层级变化。
 
 - 路径由 `ebaseline/runtime.py` 统一管理，根目录 = 项目根下的 `runtime/`
 - `runtime/` 已加入 `.gitignore`，且位于工作空间之外，不会通过
@@ -90,13 +95,15 @@ runtime/
 | 任务结束 | `done` | 写入最终 `result` |
 
 任务提前结束时同样落到 `done`，终止原因保存在 `result.stage`：
-`dependency`（依赖不满足）、`pre_script`（前置失败）、`parse_input`（input JSON 非法）。
+`dependency`（依赖不满足）、`pre_script`（前置失败）、`parse_input`（input JSON 非法）、
+`cancelled`（用户取消）、`interrupted`（服务重启中断）。
 
 ### 2.3 清理策略
 
 | 操作 | 行为 |
 |------|------|
-| 批次重跑 | 删除该批次上下文目录后重建 |
+| 批次重跑 | 新建 `attempt_<n>/` 目录，上一轮保留 |
+| 每个批次 | 只保留最近 20 个 attempt 目录，按修改时间淘汰 |
 | 每个组 | 只保留最近 20 个批次目录，按修改时间淘汰 |
 | 删除任务组 | 删除 `runtime/ebase_runs/group_<gid>/` 全部内容 |
 
@@ -214,6 +221,7 @@ upstream = eb.context_for(40001)
 ```python
 {
     "batch_id": 9,
+    "attempt": 2,
     "sid": 6,
     "gid": 7,
     "tid": 70001,
@@ -341,11 +349,15 @@ QA 闭环记录。依次尝试：
 ```python
 {
     "ok": True,
+    "success": True,
     "result": 1,
-    "result_detail": 2,
-    "verdict": "PASS",
+    "result_detail": 2,       # 2=已校验通过；3=执行成功但未配置校验
+    "verdict": "PASS",        # 没有 expect 时是 UNVALIDATED
     "agent_success": True,
+    "expect_configured": True,
     "expect_success": True,
+    "validated": True,
+    "clean_success": True,
     "metrics": {...},
     "duration_sec": 12.4,
 }
@@ -367,7 +379,9 @@ QA 闭环记录。依次尝试：
 }
 ```
 
-`verdict` 取值：`PASS` / `PARTIAL` / `FAIL` / `SKIP` / `ERROR` / `RUNNING` / `PENDING`。
+`verdict` 取值：`PASS` / `UNVALIDATED` / `PARTIAL` / `FAIL` / `SKIP` / `ERROR` /
+`RUNNING` / `PENDING`。`PASS` 只表示“配置了 expect 且通过”；没有校验脚本的执行成功是
+`UNVALIDATED`，脚本里做质量判断时不要只判断 `ok`/`result==1`。
 
 #### `results() -> dict`
 

@@ -25,6 +25,16 @@ class User(Base):
     email: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     privilege: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0=普通用户(测试权限), 1=管理员(管理任务和任务组), 2=超级管理员(全部权限)
+    # 个人 MCP API Key：只存 SHA-256 哈希，明文只在生成时返回一次
+    api_key_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True)
+    api_key_prefix: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    api_key_created_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, nullable=True)
+    api_key_last_used_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, nullable=True)
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.api_key_hash)
 
 
 class TaskGroup(Base):
@@ -71,7 +81,9 @@ class TaskBatch(Base):
     sid: Mapped[int] = mapped_column(Integer, nullable=False)  # subject id
     gid: Mapped[int] = mapped_column(Integer, nullable=False)  # group id
     status: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # 0=未执行, 1=执行中, 2=已完成, 3=执行失败, 4=部分成功
+    # 0=未执行, 1=执行中, 2=已完成, 3=执行失败, 4=部分成功, 5=已取消
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 已执行的轮次
+    manifest: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # 创建时冻结的任务/变量/脚本 hash
     create_time: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, default=datetime.utcnow)
 
 
@@ -86,7 +98,8 @@ class TaskResult(Base):
     result: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0=未执行, 1=执行成功, 2=执行失败, 3=执行中
     result_detail: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # 2=完全成功, 1=校验通过但 Agent 异常, 0=失败
+    # 3=执行成功但未配置校验, 2=完全成功(已校验通过), 1=校验通过但 Agent 异常, 0=失败
+    attempt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 所属批次执行轮次
     metrics: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON：耗时/token/轮次/工具调用等
     process: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     create_time: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, default=datetime.utcnow)
@@ -96,10 +109,10 @@ def _legacy_result_detail(process: Optional[str]) -> Optional[int]:
     """从旧日志的收尾行恢复细分状态（避免用 LIKE 误匹配 Agent 正文）。"""
     if not process:
         return None
-    m = re.search(r"=== 任务 \d+ (成功|校验通过\(Agent异常\)|失败) \(耗时", process)
+    m = re.search(r"=== 任务 \d+ (成功|未校验|校验通过\(Agent异常\)|失败) \(耗时", process)
     if not m:
         return None
-    return {"成功": 2, "校验通过(Agent异常)": 1, "失败": 0}[m.group(1)]
+    return {"成功": 2, "未校验": 3, "校验通过(Agent异常)": 1, "失败": 0}[m.group(1)]
 
 
 def _parse_legacy_metrics(process: Optional[str], result: int) -> Optional[dict]:
@@ -148,13 +161,50 @@ def _ensure_columns() -> None:
 
     engine = _get_engine()
     insp = inspect(engine)
-    if "task_result" not in insp.get_table_names():
+    tables = set(insp.get_table_names())
+
+    if "users" in tables:
+        existing = {c["name"] for c in insp.get_columns("users")}
+        additions = [
+            ("api_key_hash", "ALTER TABLE users ADD COLUMN api_key_hash CHAR(64) NULL"),
+            ("api_key_prefix", "ALTER TABLE users ADD COLUMN api_key_prefix VARCHAR(16) NULL"),
+            ("api_key_created_at",
+             "ALTER TABLE users ADD COLUMN api_key_created_at TIMESTAMP NULL"),
+            ("api_key_last_used_at",
+             "ALTER TABLE users ADD COLUMN api_key_last_used_at TIMESTAMP NULL"),
+        ]
+        pending = [ddl for name, ddl in additions if name not in existing]
+        if pending:
+            with engine.begin() as conn:
+                for ddl in pending:
+                    conn.execute(text(ddl))
+        user_indexes = {i["name"] for i in insp.get_indexes("users")}
+        if "ix_users_api_key_hash" not in user_indexes:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE INDEX ix_users_api_key_hash ON users (api_key_hash)"
+                ))
+
+    if "task_batch" in tables:
+        existing = {c["name"] for c in insp.get_columns("task_batch")}
+        additions = [
+            ("attempt", "ALTER TABLE task_batch ADD COLUMN attempt INT NOT NULL DEFAULT 0"),
+            ("manifest", "ALTER TABLE task_batch ADD COLUMN manifest TEXT NULL"),
+        ]
+        pending = [ddl for name, ddl in additions if name not in existing]
+        if pending:
+            with engine.begin() as conn:
+                for ddl in pending:
+                    conn.execute(text(ddl))
+
+    if "task_result" not in tables:
         return
 
     existing = {c["name"] for c in insp.get_columns("task_result")}
     additions = [
         ("batch_id", "ALTER TABLE task_result ADD COLUMN batch_id INT NULL"),
         ("result_detail", "ALTER TABLE task_result ADD COLUMN result_detail INT NULL"),
+        ("attempt", "ALTER TABLE task_result ADD COLUMN attempt INT NULL"),
         ("metrics", "ALTER TABLE task_result ADD COLUMN metrics TEXT NULL"),
     ]
     pending = [ddl for name, ddl in additions if name not in existing]
@@ -167,6 +217,11 @@ def _ensure_columns() -> None:
     if "ix_task_result_batch_id" not in indexes:
         with engine.begin() as conn:
             conn.execute(text("CREATE INDEX ix_task_result_batch_id ON task_result (batch_id)"))
+    if "ix_task_result_batch_attempt" not in indexes:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX ix_task_result_batch_attempt ON task_result (batch_id, attempt)"
+            ))
 
     # 旧数据没有批次归属：旧版执行前会按 sid+gid 删除历史结果，
     # 因此现存结果一定属于该 sid+gid 最近一次批次。

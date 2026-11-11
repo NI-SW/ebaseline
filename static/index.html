@@ -219,20 +219,28 @@ function jsArg(...args) {
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-const BATCH_STATUS = { 0: ['未执行','tag-gray'], 1: ['执行中','tag-blue'], 2: ['已完成','tag-green'], 3: ['执行失败','tag-red'], 4: ['部分成功','tag-orange'] };
+const BATCH_STATUS = { 0: ['未执行','tag-gray'], 1: ['执行中','tag-blue'], 2: ['已完成','tag-green'], 3: ['执行失败','tag-red'], 4: ['部分成功','tag-orange'], 5: ['已取消','tag-gray'] };
 const RESULT_TEXT = { 0: ['未执行','tag-gray'], 1: ['成功','tag-green'], 2: ['失败','tag-red'], 3: ['执行中','tag-blue'] };
 // 任务细分结果（从 process 中解析 result_detail）
-const RESULT_DETAIL = { 2: ['成功','tag-green'], 1: ['校验通过(Agent异常)','tag-orange'], 0: ['失败','tag-red'] };
-// 五态判定
+const RESULT_DETAIL = { 3: ['未校验','tag-blue'], 2: ['成功','tag-green'], 1: ['校验通过(Agent异常)','tag-orange'], 0: ['失败','tag-red'] };
+// 判定：PASS 只用于“配置了 expect 且通过”
 const VERDICT = {
   PASS: ['通过','tag-green'],
   PARTIAL: ['部分通过','tag-orange'],
   FAIL: ['失败','tag-red'],
   SKIP: ['跳过','tag-gray'],
+  UNVALIDATED: ['未校验','tag-blue'],
   ERROR: ['异常','tag-red'],
   RUNNING: ['执行中','tag-blue'],
   PENDING: ['未执行','tag-gray'],
 };
+const PRIV_TEXT = ['普通用户', '管理员', '超级管理员'];
+function privText(p) { return PRIV_TEXT[p] ?? '未知'; }
+function fmtDateTime(v) {
+  if (!v) return '-';
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? esc(v) : d.toLocaleString('zh-CN');
+}
 
 function verdictTag(v) {
   const [txt, cls] = VERDICT[v] || ['未知','tag-gray'];
@@ -289,9 +297,9 @@ function resultTag(r) {
 
 function parseResultDetail(process) {
   if (!process) return null;
-  const m = process.match(/=== 任务 \d+ (成功|校验通过\(Agent异常\)|失败) ===/);
+  const m = process.match(/=== 任务 \d+ (成功|未校验|校验通过\(Agent异常\)|失败) \(耗时/);
   if (!m) return null;
-  const map = { '成功': 2, '校验通过(Agent异常)': 1, '失败': 0 };
+  const map = { '成功': 2, '未校验': 3, '校验通过(Agent异常)': 1, '失败': 0 };
   return map[m[1]] ?? null;
 }
 
@@ -335,6 +343,7 @@ const PAGES = [
   ['subjects', '待测主体'],
   ['batches', '测试批次'],
   ['results', '执行结果'],
+  ['users', '用户管理'],
 ];
 
 function render() {
@@ -363,7 +372,7 @@ function goto(p) {
 }
 
 /* ═══════════════════════ 路由（URL hash，刷新/后退保持当前页面）═══════════════════════ */
-const TOP_PAGES = ['groups', 'subjects', 'batches', 'results'];
+const TOP_PAGES = ['groups', 'subjects', 'batches', 'results', 'users'];
 
 // #/groups | #/subjects | #/batches | #/results
 // #/tasks/<gid> | #/workspace/<gid>
@@ -409,7 +418,7 @@ async function loadPage() {
   const { page, detail } = state;
   if (page === 'tasks') return pageTasks(detail);
   if ((page === 'batches' || page === 'results') && detail) return batchDetail(detail, page);
-  const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults }[page];
+  const fn = { groups: pageGroups, subjects: pageSubjects, batches: pageBatches, results: pageResults, users: pageUsers }[page];
   if (fn) await fn();
 }
 
@@ -606,9 +615,203 @@ async function delSubject(sid) {
   toast('已删除'); pageSubjects();
 }
 
+/* ═══════════════════════ 用户管理 ═══════════════════════ */
+async function pageUsers() {
+  $('#page-title').textContent = '用户管理';
+  const me = await api('/api/v1/auth/me');
+  state.user = me;
+  const users = me.privilege >= 1 ? await api('/api/v1/users') : [];
+  const keyTag = me.has_api_key
+    ? '<span class="tag tag-green">已生成</span>'
+    : '<span class="tag tag-gray">未生成</span>';
+  const prefix = me.has_api_key ? `${esc(me.api_key_prefix || '')}…` : '-';
+  $('#content').innerHTML = `
+  <div class="card">
+    <div class="flex-between"><h2>我的账户</h2><span class="tag tag-blue">${privText(me.privilege)}</span></div>
+    <dl class="detail-grid">
+      <dt>用户 ID</dt><dd>${me.id}</dd>
+      <dt>用户名</dt><dd>${esc(me.username)}</dd>
+      <dt>邮箱</dt><dd>${esc(me.email || '-')}</dd>
+      <dt>权限等级</dt><dd>${privText(me.privilege)}（${me.privilege}）</dd>
+    </dl>
+    <div class="flex" style="margin-top:16px">
+      <button class="btn btn-default" onclick="showProfileModal(${jsArg(me)})">修改用户名/邮箱</button>
+      <button class="btn btn-default" onclick="showPasswordModal()">修改密码</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="flex-between"><h2>MCP API Key</h2>${keyTag}</div>
+    <dl class="detail-grid">
+      <dt>Key 前缀</dt><dd class="mono">${prefix}</dd>
+      <dt>生成时间</dt><dd>${fmtDateTime(me.api_key_created_at)}</dd>
+      <dt>最近使用</dt><dd>${fmtDateTime(me.api_key_last_used_at)}</dd>
+    </dl>
+    <div style="color:#999;font-size:12px;margin-top:10px;line-height:1.7">
+      MCP 客户端设置 <code>Authorization: Bearer &lt;API Key&gt;</code>。等级 0 的 Key 只能调用只读工具，
+      等级 ≥1 可调用写工具。Key 只在生成时显示一次，数据库只保存哈希。
+    </div>
+    <div class="flex" style="margin-top:16px">
+      <button class="btn" onclick="generateApiKey()">${me.has_api_key ? '重新生成 API Key' : '生成 API Key'}</button>
+      ${me.has_api_key ? '<button class="btn btn-danger" onclick="revokeMyApiKey()">撤销 API Key</button>' : ''}
+    </div>
+  </div>
+  ${me.privilege >= 1 ? _userListCard(users, me) : ''}`;
+}
+
+function _userListCard(users, me) {
+  const rows = users.map(u => {
+    const canManage = me.privilege >= 2 || u.privilege < 2;
+    let privCell;
+    if (canManage) {
+      const levels = me.privilege >= 2 ? [0, 1, 2] : [0, 1];
+      const options = levels.map(p =>
+        `<option value="${p}"${u.privilege === p ? ' selected' : ''}>${privText(p)}</option>`).join('');
+      privCell = `<select style="width:auto" onchange="changeUserPrivilege(${u.id}, Number(this.value))">${options}</select>`;
+    } else {
+      privCell = `<span class="tag tag-blue">${privText(u.privilege)}</span>`;
+    }
+    const keyCell = u.has_api_key
+      ? `<span class="tag tag-green">${esc(u.api_key_prefix || '')}…</span>`
+      : '<span class="tag tag-gray">未生成</span>';
+    const canRevoke = u.has_api_key && (me.privilege >= 2 || u.privilege < 2);
+    const action = canRevoke
+      ? `<button class="btn btn-sm btn-danger" onclick="revokeUserApiKey(${jsArg(u.id, u.username)})">撤销 Key</button>`
+      : '-';
+    return `<tr>
+      <td class="mono">${u.id}</td>
+      <td>${esc(u.username)}${u.id === me.id ? ' <span class="tag tag-blue">我</span>' : ''}</td>
+      <td>${esc(u.email || '-')}</td>
+      <td>${privCell}</td>
+      <td>${keyCell}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="card">
+    <div class="flex-between"><h2>用户列表</h2><span class="page-sub">${users.length} 个用户</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>ID</th><th>用户名</th><th>邮箱</th><th>权限</th><th>MCP API Key</th><th>操作</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="empty">暂无用户</td></tr>'}</tbody>
+    </table></div>
+    <div style="color:#999;font-size:12px;margin-top:10px">
+      等级 1 只能管理普通用户/管理员；超管只能由超管操作。修改权限会立即影响该用户 MCP Key 的读写能力。
+    </div>
+  </div>`;
+}
+
+function showProfileModal(me) {
+  showModal('修改用户名/邮箱', `
+    <div class="form-item"><label>用户名</label><input id="me_username" value="${esc(me.username)}" maxlength="32"></div>
+    <div class="form-item"><label>邮箱</label><input id="me_email" value="${esc(me.email || '')}" maxlength="128" placeholder="可选"></div>
+    <div class="form-item"><label>当前密码（验证身份）</label><input id="me_current" type="password" autocomplete="current-password"></div>
+  `, async () => {
+    const username = $('#me_username').value.trim();
+    const current = $('#me_current').value;
+    if (!username) { toast('用户名不能为空', 'error'); return false; }
+    if (!current) { toast('请输入当前密码', 'error'); return false; }
+    await api('/api/v1/users/me/profile', { method: 'PUT', body: JSON.stringify({
+      username,
+      email: $('#me_email').value.trim() || null,
+      current_password: current,
+    }) });
+    state.user = await api('/api/v1/auth/me');
+    toast('账户信息已更新');
+    render();
+  });
+}
+
+function showPasswordModal() {
+  showModal('修改密码', `
+    <div class="form-item"><label>当前密码</label><input id="pw_current" type="password" autocomplete="current-password"></div>
+    <div class="form-item"><label>新密码（至少 6 位）</label><input id="pw_new" type="password" autocomplete="new-password"></div>
+    <div class="form-item"><label>确认新密码</label><input id="pw_confirm" type="password" autocomplete="new-password"></div>
+  `, async () => {
+    const current = $('#pw_current').value;
+    const next = $('#pw_new').value;
+    const confirmValue = $('#pw_confirm').value;
+    if (!current) { toast('请输入当前密码', 'error'); return false; }
+    if (next.length < 6) { toast('新密码至少 6 位', 'error'); return false; }
+    if (next !== confirmValue) { toast('两次输入的新密码不一致', 'error'); return false; }
+    await api('/api/v1/users/me/password', { method: 'PUT', body: JSON.stringify({
+      current_password: current, new_password: next }) });
+    toast('密码已修改，下次登录请使用新密码');
+  });
+}
+
+async function generateApiKey() {
+  const me = state.user;
+  if (me?.has_api_key && !confirm('重新生成会立即使旧 API Key 失效，确认继续？')) return;
+  try {
+    const r = await api('/api/v1/users/me/api-key', { method: 'POST' });
+    showApiKeyModal(r);
+    await pageUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function showApiKeyModal(r) {
+  showModal('MCP API Key 已生成', `
+    <div style="background:#fff7e6;border:1px solid #ffd591;color:#ad6800;padding:10px 12px;border-radius:6px;margin-bottom:14px;font-size:13px">${esc(r.message)}</div>
+    <div class="form-item"><label>API Key</label>
+      <textarea id="new_api_key" rows="3" readonly style="font-family:Consolas,monospace">${esc(r.api_key)}</textarea>
+    </div>
+    <div class="flex"><button class="btn" onclick="copyApiKey()">复制 API Key</button></div>
+    <div style="color:#999;font-size:12px;margin-top:12px;line-height:1.7">
+      客户端设置 <code>Authorization: Bearer &lt;API Key&gt;</code>。关闭后无法再次查看，只能重新生成。
+    </div>
+  `, null);
+}
+
+function copyApiKey() {
+  const el = $('#new_api_key');
+  if (!el) return;
+  const key = el.value;
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(key)
+      .then(() => toast('已复制 API Key'))
+      .catch(() => { el.select(); document.execCommand('copy'); toast('已复制 API Key'); });
+  } else {
+    el.select();
+    try { document.execCommand('copy'); toast('已复制 API Key'); }
+    catch { toast('复制失败，请手动选择', 'error'); }
+  }
+}
+
+async function revokeMyApiKey() {
+  if (!confirm('撤销后使用该 Key 的 MCP 客户端会立即失效，确认？')) return;
+  try {
+    await api('/api/v1/users/me/api-key', { method: 'DELETE' });
+    toast('API Key 已撤销');
+  } catch (e) { toast(e.message, 'error'); }
+  await pageUsers();
+}
+
+async function changeUserPrivilege(userId, level) {
+  if (!confirm(`确认将该用户权限改为「${privText(level)}」？`)) { await pageUsers(); return; }
+  try {
+    await api(`/api/v1/users/${userId}/privilege`, {
+      method: 'PUT', body: JSON.stringify({ privilege: level }) });
+    toast('权限已更新');
+    if (userId === state.user?.id) {
+      state.user = await api('/api/v1/auth/me');
+      render();
+      return;
+    }
+  } catch (e) { toast(e.message, 'error'); }
+  await pageUsers();
+}
+
+async function revokeUserApiKey(userId, username) {
+  if (!confirm(`撤销用户 ${username} 的 API Key？其 MCP 客户端会立即失效。`)) return;
+  try {
+    await api(`/api/v1/users/${userId}/api-key`, { method: 'DELETE' });
+    toast('API Key 已撤销');
+  } catch (e) { toast(e.message, 'error'); }
+  await pageUsers();
+}
+
 /* ═══════════════════════ 批次 ═══════════════════════ */
 let _batchDetailTimer = null;
 let _batchDetailData = null;   // 当前批次详情（单任务执行时用于检查依赖）
+let _batchViewAttempt = null;  // 当前查看的 attempt（null=最新）
 let _batchTaskStartedAt = 0;   // 单任务启动时间（等待后台写入“执行中”记录）
 let _batchGroupGids = [];      // 当前批次页的任务组 gid（全部展开/折叠用）
 const _batchGroupOpen = new Set();  // 展开的任务组 gid（跨列表刷新保留）
@@ -653,7 +856,9 @@ function aggregateBatchGroup(items) {
   const pass = _sumMetric(items, 'pass');
   const partial = _sumMetric(items, 'partial');
   const fail = _sumMetric(items, 'fail');
-  const executed = pass + partial + fail;
+  const unvalidated = _sumMetric(items, 'unvalidated');
+  const validated = pass + partial + fail;
+  const executed = validated + unvalidated;
 
   const durations = _weightedMetric(items, 'duration_avg', 'duration_samples');
   const agentDurations = _weightedMetric(items, 'agent_duration_avg', 'agent_duration_samples');
@@ -670,9 +875,10 @@ function aggregateBatchGroup(items) {
     count: items.length,
     subjectCount: new Set(items.map(b => b.sid)).size,
     taskCount: Math.max(0, ...items.map(b => _metricNum(b, 'task_count') || 0)),
-    pass, partial, fail, executed,
+    pass, partial, fail, unvalidated, validated, executed,
     strictRate: (pass + fail) ? pass / (pass + fail) : null,
     passRate: executed ? pass / executed : null,
+    coverage: executed ? validated / executed : null,
     durations, agentDurations, rounds, tools, tokens,
     p95: p95s.length ? Math.max(...p95s) : null,
     tokensTotal: tokenTotals.length ? tokenTotals.reduce((a, v) => a + v, 0) : null,
@@ -712,7 +918,7 @@ function expandAllBatchGroups(open) {
 function _batchGroupHtml(group, subjMap) {
   const open = _batchGroupOpen.has(group.gid);
   const agg = group.agg;
-  const statusTags = [0, 1, 2, 3, 4]
+  const statusTags = [0, 1, 2, 3, 4, 5]
     .filter(st => agg.statusCounts[st])
     .map(st => {
       const [txt, cls] = BATCH_STATUS[st] || ['未知', 'tag-gray'];
@@ -723,8 +929,13 @@ function _batchGroupHtml(group, subjMap) {
       agg.pass + agg.fail ? `严格口径 · ${fmtInt(agg.pass + agg.fail)} 个结果` : '暂无有效结果',
       'PASS / (PASS + FAIL)，累计组内所有批次的执行结果', _rateClass(agg.strictRate)),
     _bgMetric('含 PARTIAL 通过率', fmtPct(agg.passRate),
-      agg.executed ? `计入部分通过 · ${fmtInt(agg.executed)} 个结果` : '暂无已执行结果',
-      'PASS / (PASS + PARTIAL + FAIL)，把 PARTIAL（校验通过但 Agent 异常）计入分母'),
+      agg.executed ? `已执行 ${fmtInt(agg.executed)} 个结果` : '暂无已执行结果',
+      'PASS / (PASS + PARTIAL + FAIL + UNVALIDATED)', _rateClass(agg.passRate)),
+    _bgMetric('校验覆盖率', fmtPct(agg.coverage),
+      agg.executed ? `已校验 ${fmtInt(agg.validated)} / ${fmtInt(agg.executed)}` : '暂无已执行结果',
+      '已校验任务 / 已执行任务；未校验任务不进入严格通过率'),
+    _bgMetric('未校验', fmtInt(agg.unvalidated), '执行成功但无校验脚本',
+      'result_detail=3：Agent 执行成功，但没有 expect 校验，不能算质量通过'),
     _bgMetric('平均耗时', fmtSec(agg.durations.value),
       agg.durations.samples ? `${fmtInt(agg.durations.samples)} 个任务样本` : '暂无样本',
       '各批次平均耗时按任务样本数加权'),
@@ -765,7 +976,7 @@ function _batchGroupHtml(group, subjMap) {
     </div>
     <div class="batch-group-body"${open ? '' : ' style="display:none"'}>
       <div class="table-wrap"><table>
-        <thead><tr><th>ID</th><th>待测主体</th><th>状态</th><th>任务数</th><th>通过/部分/失败/跳过</th><th>严格通过率</th><th>含 PARTIAL</th><th>平均耗时</th><th>P95 耗时</th><th>平均 Token</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>待测主体</th><th>状态</th><th>任务数</th><th>通过/部分/失败/跳过/未校验</th><th>严格通过率</th><th>校验覆盖率</th><th>已执行通过率</th><th>平均耗时</th><th>P95 耗时</th><th>平均 Token</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody>${group.items.map(b => {
           const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
           const m = b.metrics || {};
@@ -774,15 +985,17 @@ function _batchGroupHtml(group, subjMap) {
             <td class="mono">${esc(subjMap[b.sid] || `sid=${b.sid}`)}</td>
             <td><span class="tag ${cls}">${txt}</span></td>
             <td>${fmtInt(m.task_count)}</td>
-            <td title="通过 / 部分 / 失败 / 跳过">
+            <td title="通过 / 部分 / 失败 / 跳过 / 未校验">
               <div class="flex" style="flex-wrap:nowrap;gap:4px">
                 <span class="tag tag-green">${fmtInt(m.pass)}</span>
                 <span class="tag tag-orange">${fmtInt(m.partial)}</span>
                 <span class="tag tag-red">${fmtInt(m.fail)}</span>
                 <span class="tag tag-gray">${fmtInt(m.skip)}</span>
+                <span class="tag tag-blue">${fmtInt(m.unvalidated)}</span>
               </div>
             </td>
             <td>${fmtPct(m.strict_pass_rate)}</td>
+            <td>${fmtPct(m.validation_coverage)}</td>
             <td>${fmtPct(m.pass_rate)}</td>
             <td>${fmtSec(m.duration_avg)}</td>
             <td>${fmtSec(m.duration_p95)}</td>
@@ -902,38 +1115,89 @@ async function runBatchTask(tid) {
   setTimeout(() => batchDetail(b.id, b._fromPage || 'batches'), 800);
 }
 
-async function batchDetail(bid, fromPage = 'batches') {
+async function openPrecheck(bid) {
+  try {
+    const p = await api(`/api/v1/batches/${bid}/precheck`);
+    const issues = (p.dependency_issues || []).map(x => `<li>${esc(x)}</li>`).join('') || '<li>依赖图正常</li>';
+    const warnings = (p.warnings || []).map(x => `<li>${esc(x)}</li>`).join('') || '<li>无</li>';
+    showModal(`批次 #${bid} 执行前预检`, `
+      <dl class="detail-grid">
+        <dt>任务数</dt><dd>${fmtInt(p.task_count)}</dd>
+        <dt>定义来源</dt><dd>${p.from_manifest ? '批次创建时冻结的清单' : '当前任务定义（旧批次无清单）'}</dd>
+        <dt>可执行</dt><dd>${p.ok ? '<span class="tag tag-green">是</span>' : '<span class="tag tag-red">否</span>'}</dd>
+      </dl>
+      <div class="form-item" style="margin-top:16px"><label>依赖问题</label><ul>${issues}</ul></div>
+      <div class="form-item"><label>提醒</label><ul>${warnings}</ul></div>
+    `, null);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function batchDetail(bid, fromPage = 'batches', attempt = null) {
   if (_batchDetailTimer) { clearInterval(_batchDetailTimer); _batchDetailTimer = null; }
-  const b = await api(`/api/v1/batches/${bid}`);
+  _batchViewAttempt = (attempt === undefined ? null : attempt);
+  const qs = _batchViewAttempt === null ? '' : `?attempt=${encodeURIComponent(_batchViewAttempt)}`;
+  const b = await api(`/api/v1/batches/${bid}${qs}`);
   b._fromPage = fromPage;
   _batchDetailData = b;
   const [txt, cls] = BATCH_STATUS[b.status] || ['未知', 'tag-gray'];
   const m = b.metrics || {};
   const tasks = b.tasks || [];
   const runningTid = b.running_task_tid ?? null;  // 服务端实时运行状态（丢弃重启前的残留）
-  const taskRunnable = b.status !== 1 && runningTid === null;
+  const viewingHistory = b.viewing_attempt !== null && b.viewing_attempt !== b.attempt;
+  const taskRunnable = b.status !== 1 && runningTid === null && !viewingHistory;
+  const attemptOptions = [
+    `<option value="" ${_batchViewAttempt === null ? 'selected' : ''}>最新（attempt ${fmtInt(b.attempt)}）</option>`,
+    ...((b.available_attempts || []).map(a =>
+      `<option value="${a}" ${_batchViewAttempt !== null && Number(a) === Number(b.viewing_attempt) ? 'selected' : ''}>attempt ${a}</option>`)),
+  ].join('');
+  const missing = (b.manifest_summary && b.manifest_summary.scripts_missing) || [];
+  const manifestHtml = b.manifest_summary ? `
+    <dl class="detail-grid">
+      <dt>清单版本</dt><dd>${fmtInt(b.manifest_summary.manifest_version)}</dd>
+      <dt>冻结时间</dt><dd class="mono">${esc(b.manifest_summary.created_at || '-')}</dd>
+      <dt>任务数</dt><dd>${fmtInt(b.manifest_summary.task_count)}</dd>
+      <dt>脚本缺失</dt><dd>${missing.length
+        ? missing.map(x => `<span class="tag tag-red">${esc(x.tid)}.${esc(x.field)}</span>`).join(' ')
+        : '<span class="tag tag-green">无</span>'}</dd>
+    </dl>
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;color:#1890ff">查看清单摘要（变量已脱敏）</summary>
+      <div class="log-view" style="margin-top:8px;max-height:260px">${esc(JSON.stringify(b.manifest_summary, null, 2))}</div>
+    </details>` : '<div style="color:#999">该批次创建于清单机制之前，详情使用当前任务定义，无法还原创建时的定义。</div>';
   $('#page-title').textContent = `批次 #${b.id} 详情`;
   $('#content').innerHTML = `
   <div class="card">
-    <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span>${runningTid !== null ? '<span class="tag tag-blue">任务执行中</span>' : ''}</h2>
+    <div class="flex-between"><h2>批次 #${b.id} 详情 <span class="tag ${cls}">${txt}</span>
+        <span class="tag tag-gray">当前 attempt ${fmtInt(b.attempt)}</span>
+        ${viewingHistory ? `<span class="tag tag-orange">查看历史 attempt ${fmtInt(b.viewing_attempt)}</span>` : ''}
+        ${runningTid !== null ? '<span class="tag tag-blue">任务执行中</span>' : ''}</h2>
       <div class="flex">
+        <select id="batch-attempt-sel" style="width:auto" title="查看某一轮历史结果"
+          onchange="batchDetail(${jsArg(bid, fromPage)}, this.value === '' ? null : Number(this.value))">${attemptOptions}</select>
+        <button class="btn btn-default" onclick="openPrecheck(${bid})">预检</button>
+        <button class="btn btn-default" onclick="batchDetail(${jsArg(bid, fromPage)}, ${_batchViewAttempt === null ? 'null' : Number(_batchViewAttempt)})">刷新</button>
+        <button class="btn btn-default" onclick="exportBatchCsv(${bid}, ${_batchViewAttempt === null ? 'null' : Number(_batchViewAttempt)})">导出 CSV</button>
         <button class="btn btn-default" onclick="goto(${jsArg(fromPage)})">返回</button>
-        <button class="btn btn-default" onclick="batchDetail(${jsArg(bid, fromPage)})">刷新</button>
-        <button class="btn btn-default" onclick="exportBatchCsv(${bid})">导出 CSV</button>
         ${state.user.privilege >= 1 ? `<button class="btn btn-danger" onclick="delBatch(${jsArg(bid, fromPage)})">删除批次</button>` : ''}
       </div></div>
     <dl class="detail-grid">
       <dt>批次 ID</dt><dd>${b.id}</dd>
       <dt>待测主体</dt><dd class="mono">${esc(b.subject_name || `sid=${b.sid}`)}</dd>
       <dt>任务组</dt><dd>${esc(b.group_name || `gid=${b.gid}`)}</dd>
+      <dt>定义来源</dt><dd>${(tasks[0] || {}).definition_source === 'manifest'
+        ? '<span class="tag tag-green">批次冻结清单</span>'
+        : '<span class="tag tag-orange">当前任务定义（旧批次）</span>'}</dd>
       <dt>创建时间</dt><dd class="mono">${new Date(b.create_time).toLocaleString('zh-CN')}</dd>
     </dl>
   </div>
-  <div class="card"><h2>批次指标</h2>
+  <div class="card"><h2>批次清单</h2>${manifestHtml}</div>
+  <div class="card"><h2>批次指标${viewingHistory ? `（attempt ${fmtInt(b.viewing_attempt)}）` : ''}</h2>
     <div class="metric-grid">
       ${metricCard('任务数', fmtInt(m.task_count), `已记录 ${fmtInt(m.result_count)}`)}
-      ${metricCard('通过 / 部分 / 失败 / 跳过', `${fmtInt(m.pass)} / ${fmtInt(m.partial)} / ${fmtInt(m.fail)} / ${fmtInt(m.skip)}`, `执行中 ${fmtInt(m.running)}，未执行 ${fmtInt(m.pending)}`)}
-      ${metricCard('严格通过率', fmtPct(m.strict_pass_rate), `含 PARTIAL ${fmtPct(m.pass_rate)}`)}
+      ${metricCard('通过 / 部分 / 失败 / 跳过 / 未校验', `${fmtInt(m.pass)} / ${fmtInt(m.partial)} / ${fmtInt(m.fail)} / ${fmtInt(m.skip)} / ${fmtInt(m.unvalidated)}`, `执行中 ${fmtInt(m.running)}，未执行 ${fmtInt(m.pending)}`)}
+      ${metricCard('严格通过率', fmtPct(m.strict_pass_rate), `PASS / (PASS + FAIL)；已执行口径 ${fmtPct(m.pass_rate)}`, '只有配置了 expect 且通过的任务才计入 PASS')}
+      ${metricCard('校验覆盖率', fmtPct(m.validation_coverage), `已校验 ${fmtInt(m.validated)} / 已执行 ${fmtInt(m.executed)}`, '已校验任务 / 已执行任务；未校验任务不能算质量通过')}
+      ${m.clean_failed ? metricCard('清理失败', fmtInt(m.clean_failed), 'clean 返回非 0，已按失败处理') : ''}
       ${metricCard('平均耗时', fmtSec(m.duration_avg), `P95 ${fmtSec(m.duration_p95)}（${fmtInt(m.duration_samples)} 样本）`, 'P95 取升序第 min(n-1, int(n*0.95)) 个；样本少时等于最慢一次')}
       ${metricCard('平均 Agent 耗时', fmtSec(m.agent_duration_avg), `${fmtInt(m.agent_duration_samples)} 样本`)}
       ${metricCard('平均模型往返', fmtNum(m.rounds_avg), `${fmtInt(m.rounds_samples)} 样本`)}
@@ -943,9 +1207,9 @@ async function batchDetail(bid, fromPage = 'batches') {
       ${metricCard('首字延迟 P95', fmtMs(m.first_token_p95), `${fmtInt(m.first_token_samples)} 样本`)}
     </div>
   </div>
-  <div class="card"><h2>任务执行结果</h2>
+  <div class="card"><h2>任务执行结果${viewingHistory ? `（历史 attempt ${fmtInt(b.viewing_attempt)}，只读）` : ''}</h2>
     <div class="table-wrap"><table>
-    <thead><tr><th>TID</th><th>任务</th><th>依赖</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
+    <thead><tr><th>TID</th><th>轮次</th><th>任务</th><th>依赖</th><th>状态</th><th>耗时</th><th>Agent 耗时</th><th>模型往返</th><th>工具调用</th><th>Token（入/出/总）</th><th>首字延迟</th><th>完成时间</th><th>操作</th></tr></thead>
     <tbody>${tasks.map(t => {
       const tm = t.metrics || {};
       const token = tm.tokens
@@ -953,17 +1217,24 @@ async function batchDetail(bid, fromPage = 'batches') {
         : '-';
       const toolTitle = esc((tm.tool_names || []).join(', '));
       const logBtn = t.result_id
-        ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${t.result_id}, '任务 ${t.tid} 执行日志', ${t.result === 3})">${t.result === 3 ? '实时日志' : '查看日志'}</button>`
+        ? `<button class="btn btn-sm btn-default" onclick="openLogViewer(${t.result_id}, '任务 ${t.tid}（attempt ${fmtInt(t.attempt)}）执行日志', ${t.result === 3})">${t.result === 3 ? '实时日志' : '查看日志'}</button>`
+        : '';
+      const defBadge = t.definition_source === 'manifest'
+        ? '<span class="tag tag-gray" title="使用批次创建时冻结的任务定义">清单</span>'
+        : '<span class="tag tag-orange" title="使用当前任务定义，可能与批次创建时不一致">当前</span>';
+      const missingBadge = (t.scripts_missing || []).length
+        ? `<span class="tag tag-red" title="创建批次时缺失脚本: ${esc((t.scripts_missing || []).join(', '))}">脚本缺失</span>`
         : '';
       const isLiveRunning = runningTid === t.tid;
       const runBtn = isLiveRunning
         ? '<button class="btn btn-sm btn-default" disabled style="opacity:.45;cursor:not-allowed">执行中</button>'
         : taskRunnable
           ? `<button class="btn btn-sm btn-success" onclick="runBatchTask(${t.tid})"${t.result === 3 ? ' title="上次执行未正常结束，可重新执行"' : ''}>执行</button>`
-          : '<button class="btn btn-sm btn-default" disabled style="opacity:.45;cursor:not-allowed" title="批次或其他任务正在执行">执行</button>';
+          : `<button class="btn btn-sm btn-default" disabled style="opacity:.45;cursor:not-allowed" title="${viewingHistory ? '查看历史轮次时不能执行，请切换回最新' : '批次或其他任务正在执行'}">执行</button>`;
       return `<tr>
         <td class="mono">${t.tid}</td>
-        <td>${esc(t.name)}</td>
+        <td class="mono">${t.attempt != null ? t.attempt : '-'}</td>
+        <td>${esc(t.name)} ${defBadge}${missingBadge}</td>
         <td class="mono">${(t.depends || []).join(', ') || '-'}</td>
         <td>${resultTag(t)}</td>
         <td>${fmtSec(tm.duration_sec)}</td>
@@ -974,7 +1245,7 @@ async function batchDetail(bid, fromPage = 'batches') {
         <td>${fmtMs(tm.first_token_ms)}</td>
         <td class="mono">${t.create_time ? new Date(t.create_time).toLocaleString('zh-CN') : '-'}</td>
         <td><div class="flex" style="flex-wrap:nowrap;gap:6px">${logBtn}${runBtn}</div></td></tr>`;
-    }).join('') || '<tr><td colspan="12" class="empty">暂无任务</td></tr>'}
+    }).join('') || '<tr><td colspan="13" class="empty">暂无任务</td></tr>'}
     </tbody></table></div>
   </div>`;
   if (runningTid !== null) _batchTaskStartedAt = 0;
@@ -983,7 +1254,7 @@ async function batchDetail(bid, fromPage = 'batches') {
   if (b.status === 1 || runningTid !== null || pendingTaskStart) {
     _batchDetailTimer = setInterval(() => {
       if ($('#page-title') && document.querySelector('.fullscreen-log') === null) {
-        batchDetail(bid, fromPage);
+        batchDetail(bid, fromPage, _batchViewAttempt);
       }
     }, 3000);
   }
@@ -1047,8 +1318,9 @@ async function refreshLogViewer() {
     logEl.textContent = r.process || '（暂无日志）';
     if (wasAtBottom) logEl.parentElement.scrollTop = logEl.parentElement.scrollHeight;
 
-    const [rt, rc] = getResultTag(r.result, r.process);
-    metaEl.textContent = `sid=${r.sid} gid=${r.gid} tid=${r.tid} | 结果: ${rt} | 时间: ${new Date(r.create_time).toLocaleString('zh-CN')}`;
+    const rt = r.metrics?.verdict_text || getResultTag(r.result, r.process)[0];
+    const attemptText = r.attempt != null ? ` attempt=${r.attempt}` : '';
+    metaEl.textContent = `sid=${r.sid} gid=${r.gid} tid=${r.tid}${attemptText} | 结果: ${rt} | 时间: ${new Date(r.create_time).toLocaleString('zh-CN')}`;
     updatedEl.textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
 
     // 任务已结束（1=成功 2=失败）则停止实时刷新；0=未执行 3=执行中 继续刷新
@@ -1079,8 +1351,9 @@ function closeLogViewer() {
   document.body.style.overflow = '';
 }
 
-async function exportBatchCsv(bid) {
-  const res = await fetch(`/api/v1/results/export?batch_id=${bid}`, {
+async function exportBatchCsv(bid, attempt = null) {
+  const qs = `batch_id=${bid}` + (attempt === null || attempt === undefined ? '' : `&attempt=${attempt}`);
+  const res = await fetch(`/api/v1/results/export?${qs}`, {
     headers: { 'Authorization': `Bearer ${state.token}` },
   });
   if (!res.ok) { toast('导出失败（批次可能没有结果）', 'error'); return; }
@@ -1112,8 +1385,8 @@ async function pageResults() {
     </div>
     <div class="table-wrap"><table><thead><tr>
       <th>批次</th><th>待测主体</th><th>任务组</th><th>状态</th>
-      <th>任务数</th><th>通过</th><th>部分</th><th>失败</th><th>跳过</th>
-      <th>严格通过率</th><th>含 PARTIAL</th><th>平均耗时</th><th>P95 耗时</th>
+      <th>任务数</th><th>通过</th><th>部分</th><th>失败</th><th>跳过</th><th>未校验</th>
+      <th>严格通过率</th><th>校验覆盖率</th><th>已执行通过率</th><th>平均耗时</th><th>P95 耗时</th>
       <th>平均 Token</th><th>Token 样本</th><th>平均往返</th><th>平均工具</th>
       <th>创建时间</th><th>操作</th>
     </tr></thead>
@@ -1130,7 +1403,9 @@ async function pageResults() {
         <td><span class="tag tag-orange">${fmtInt(m.partial)}</span></td>
         <td><span class="tag tag-red">${fmtInt(m.fail)}</span></td>
         <td><span class="tag tag-gray">${fmtInt(m.skip)}</span></td>
+        <td><span class="tag tag-blue">${fmtInt(m.unvalidated)}</span></td>
         <td>${fmtPct(m.strict_pass_rate)}</td>
+        <td>${fmtPct(m.validation_coverage)}</td>
         <td>${fmtPct(m.pass_rate)}</td>
         <td>${fmtSec(m.duration_avg)}</td>
         <td>${fmtSec(m.duration_p95)}</td>
@@ -1143,14 +1418,14 @@ async function pageResults() {
           <button class="btn btn-sm btn-default" onclick="navigate('result/${b.id}')">详情</button>
           ${canEdit ? `<button class="btn btn-sm btn-danger" onclick="delBatch(${b.id}, 'results')">删除</button>` : ''}
         </td></tr>`;
-    }).join('') || '<tr><td colspan="19" class="empty">暂无批次结果</td></tr>'}
+    }).join('') || '<tr><td colspan="21" class="empty">暂无批次结果</td></tr>'}
     </tbody></table></div>
   </div>`;
 }
 
 /* ═══════════════════════ 工作空间（VS Code 风格）═══════════════════════ */
 let _wsGid = null, _wsGname = '', _wsPath = '', _wsFile = null, _wsDirty = false;
-let _wsTerm = null, _wsSocket = null, _wsFit = null;
+let _wsTerm = null, _wsSocket = null, _wsFit = null, _wsCaps = null;
 
 async function openWorkspace(gid, gname) {
   _wsGid = gid; _wsGname = gname; _wsPath = ''; _wsFile = null; _wsDirty = false;
@@ -1160,7 +1435,7 @@ async function openWorkspace(gid, gname) {
 function closeWorkspace() {
   if (_wsTerm) { _wsTerm.dispose(); _wsTerm = null; }
   if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
-  _wsFit = null;
+  _wsFit = null; _wsCaps = null;
   _wsGid = null; _wsGname = ''; _wsPath = ''; _wsFile = null; _wsDirty = false;
 }
 
@@ -1200,7 +1475,7 @@ async function renderWorkspaceFull() {
           <span>终端 — group-${ _wsGid} (bash)</span>
           <span class="ops">
             <button onclick="wsTermToggle()" id="ws-term-toggle">收起</button>
-            <button onclick="wsTermReconnect()">重连</button>
+            <button onclick="wsTermReconnect()" id="ws-term-reconnect">重连</button>
           </span>
         </div>
         <div id="ws-terminal"></div>
@@ -1214,7 +1489,16 @@ async function renderWorkspaceFull() {
     </div>
   </div>`;
   await wsLoadTree();
-  wsInitTerminal();
+  try {
+    _wsCaps = await api('/api/v1/workspace/capabilities');
+  } catch (e) {
+    _wsCaps = { terminal_allowed: false, reason: `无法获取终端能力：${e.message}` };
+  }
+  if (_wsCaps.terminal_allowed) {
+    wsInitTerminal();
+  } else {
+    showTerminalDisabled(_wsCaps.reason || 'Web 终端不可用');
+  }
 
   // Ctrl+S 保存
   document.getElementById('ws-textarea').addEventListener('keydown', e => {
@@ -1310,7 +1594,28 @@ function wsTermToggle() {
   if (_wsFit && !w.classList.contains('collapsed')) setTimeout(() => _wsFit.fit(), 50);
 }
 
+function showTerminalDisabled(reason) {
+  const el = $('#ws-terminal');
+  if (el) {
+    el.innerHTML = `<div style="color:#ffb86b;padding:20px;font-size:13px;line-height:1.7">
+      <div style="font-size:15px;margin-bottom:8px">Web 终端已禁用</div>
+      <div>${esc(reason)}</div>
+      <div style="color:#888;margin-top:10px">文件浏览/编辑仍可使用；如需终端，请联系管理员调整 workspace 配置或改用非 root 运行。</div>
+    </div>`;
+  }
+  const st = $('#ws-term-status');
+  if (st) st.textContent = '终端：已禁用';
+  const toggle = $('#ws-term-toggle');
+  if (toggle) toggle.disabled = true;
+  const reconnect = $('#ws-term-reconnect');
+  if (reconnect) reconnect.disabled = true;
+}
+
 function wsTermReconnect() {
+  if (_wsCaps && !_wsCaps.terminal_allowed) {
+    showTerminalDisabled(_wsCaps.reason || 'Web 终端不可用');
+    return;
+  }
   if (_wsSocket) { _wsSocket.close(); _wsSocket = null; }
   if (_wsTerm) { _wsTerm.clear(); }
   wsInitTerminal();

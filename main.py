@@ -36,6 +36,14 @@ def main():
     from ebaseline.models import create_all
     create_all()
 
+    # 启动对账：上次进程退出/重启时残留的“执行中”状态标记为中断
+    from ebaseline.executor import reconcile_interrupted
+    reconciled = reconcile_interrupted()
+    if reconciled["batches"] or reconciled["results"]:
+        print(
+            f"[ebaseline] 启动对账: {reconciled['batches']} 个批次、"
+            f"{reconciled['results']} 条执行中结果已标记为中断")
+
     print(f"[ebaseline] 配置文件: {cfg.path}")
     print(f"[ebaseline] 数据库: {cfg.db_user}@{cfg.db_host}:{cfg.db_port}/{cfg.db_schema}")
     print(f"[ebaseline] REST API: http://{cfg.server_host}:{cfg.server_port}")
@@ -94,6 +102,7 @@ app.include_router(subjects.router)
 app.include_router(batches.router)
 app.include_router(results.router)
 app.include_router(workspace.router)
+app.include_router(workspace.capabilities_router)
 
 
 @app.get("/", include_in_schema=False)

@@ -10,25 +10,31 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import pty
 import shutil
 import signal
 import struct
-import subprocess
 import termios
 import threading
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import crud, models
-from ..auth import require_privilege, decode_token
+from ..auth import require_privilege, decode_token, get_current_user
+from ..config import get_config
 from ..database import get_db
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/groups/{gid}/workspace", tags=["workspace"])
+# 不依赖 gid 的工作空间能力查询（前端据此决定是否初始化终端）
+capabilities_router = APIRouter(prefix="/api/v1/workspace", tags=["workspace"])
 
 # 项目根目录 = ebaseline/ 包的上一级（main.py 所在目录）
 WORKSPACES_ROOT = Path(__file__).resolve().parent.parent.parent / "workspaces"
@@ -120,6 +126,38 @@ def _check_group(db: Session, gid: int) -> models.TaskGroup:
     if group is None:
         raise HTTPException(status_code=404, detail="任务组不存在")
     return group
+
+
+def terminal_policy(user: Optional[models.User] = None) -> dict:
+    """Web 终端的能力判断（REST 能力查询与 WebSocket 共用）。"""
+    cfg = get_config()
+    is_root = os.geteuid() == 0
+    enabled = cfg.workspace_terminal_enabled
+    min_privilege = cfg.workspace_terminal_min_privilege
+    reason = ""
+    if not enabled:
+        reason = "Web 终端已在配置中关闭"
+    elif user is not None and user.privilege < min_privilege:
+        reason = f"终端需要权限等级 >= {min_privilege}，当前为 {user.privilege}"
+    elif is_root and not cfg.workspace_allow_root_execution:
+        reason = (
+            "服务以 root 运行，终端会继承 root 身份，已默认禁用；"
+            "请改用非 root 账号/隔离容器运行，或显式设置 "
+            "workspace.allow_root_execution=true"
+        )
+    return {
+        "terminal_enabled": enabled,
+        "terminal_min_privilege": min_privilege,
+        "running_as_root": is_root,
+        "terminal_allowed": not reason,
+        "reason": reason,
+    }
+
+
+@capabilities_router.get("/capabilities")
+def workspace_capabilities(user: models.User = Depends(get_current_user)):
+    """当前用户能否打开 Web 终端（只读，不创建任何目录）。"""
+    return terminal_policy(user)
 
 
 # ── 文件 API ──────────────────────────────────────────────────
@@ -274,6 +312,13 @@ async def terminal_ws(websocket: WebSocket, gid: int, token: str = Query(...)):
             return
         if crud.get_task_group(db, gid) is None:
             await websocket.close(code=4404)
+            return
+        policy = terminal_policy(user)
+        if not policy["terminal_allowed"]:
+            logger.warning(
+                "拒绝 Web 终端: user=%s gid=%s reason=%s",
+                user.username, gid, policy["reason"])
+            await websocket.close(code=4403, reason=policy["reason"])
             return
     finally:
         db.close()

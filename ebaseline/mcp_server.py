@@ -25,7 +25,17 @@ from fastapi import HTTPException
 from mcp.server import FastMCP
 from sqlalchemy.orm import Session
 
-from . import crud, executor, models, runtime, schemas
+from . import (
+    crud,
+    executor,
+    manifest as manifest_mod,
+    mcp_auth,
+    models,
+    runtime,
+    schemas,
+    task_graph,
+)
+from .config import get_config
 from .database import _get_session_factory
 from .executor import render_variables
 from .metrics import (
@@ -35,11 +45,13 @@ from .metrics import (
     result_summary,
 )
 from .routers.workspace import _safe_resolve, _workspace_dir, delete_workspace
+from .security import mask_variables
 
 mcp = FastMCP("ebaseline", stateless_http=True)
 
 _STATUS_TEXT = {
     0: "未执行", 1: "执行中", 2: "已完成", 3: "执行失败", 4: "部分成功",
+    5: "已取消",
 }
 
 
@@ -57,7 +69,10 @@ def _parse_depends(depends_str: Optional[str]) -> Optional[list[int]]:
     """把 task_list.depends（逗号分隔）解析为 tid 列表。"""
     if not depends_str:
         return None
-    return [int(x.strip()) for x in depends_str.split(",") if x.strip()]
+    try:
+        return task_graph.parse_depends(depends_str) or None
+    except task_graph.DependencyError:
+        return None
 
 
 def _task_to_dict(task: models.TaskList) -> dict:
@@ -89,6 +104,9 @@ def _group_to_dict(group: models.TaskGroup) -> dict:
             variables = json.loads(group.variables)
         except json.JSONDecodeError:
             variables = group.variables
+    cfg = get_config()
+    if variables is not None and cfg.security_mask_group_secrets:
+        variables = mask_variables(variables, cfg.security_mask_placeholder)
     return {
         "id": group.id,
         "name": group.name,
@@ -123,6 +141,7 @@ def _result_to_dict(result: models.TaskResult, max_process: Optional[int] = 2000
         "tid": result.tid,
         "result": result.result,
         "result_detail": result.result_detail,
+        "attempt": result.attempt,
         "verdict": summary["verdict"],
         "verdict_text": summary["verdict_text"],
         "metrics": summary,
@@ -139,6 +158,7 @@ def _batch_to_dict(batch: models.TaskBatch, metrics: Optional[dict] = None) -> d
         "gid": batch.gid,
         "status": batch.status,
         "status_text": _STATUS_TEXT.get(batch.status, "未知"),
+        "attempt": getattr(batch, "attempt", 0) or 0,
         "create_time": batch.create_time.isoformat() if batch.create_time else None,
         "metrics": metrics or {},
     }
@@ -153,13 +173,14 @@ def _batch_metrics_map(db: Session, batches: list[models.TaskBatch]) -> dict[int
         if r.batch_id is not None:
             by_batch.setdefault(r.batch_id, []).append(r)
     task_counts = crud.count_tasks_by_gid(db, {b.gid for b in batches})
-    return {
-        b.id: compute_batch_metrics(
-            by_batch.get(b.id, []),
-            task_count=task_counts.get(b.gid, 0),
-        )
-        for b in batches
-    }
+    out: dict[int, dict] = {}
+    for b in batches:
+        rows = by_batch.get(b.id, [])
+        if getattr(b, "attempt", 0) and b.attempt > 0:
+            rows = [r for r in rows if r.attempt == b.attempt]
+        out[b.id] = compute_batch_metrics(
+            rows, task_count=task_counts.get(b.gid, 0))
+    return out
 
 
 def _build_task_input(
@@ -185,7 +206,7 @@ def _results_csv_text(results: list[models.TaskResult]) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "id", "batch_id", "sid", "gid", "tid", "result", "result_detail",
+        "id", "batch_id", "attempt", "sid", "gid", "tid", "result", "result_detail",
         "verdict", "duration_sec", "agent_duration_sec", "rounds", "tool_calls",
         "tokens_input", "tokens_output", "tokens_total", "first_token_ms",
         "process", "create_time",
@@ -194,7 +215,7 @@ def _results_csv_text(results: list[models.TaskResult]) -> str:
         m = result_summary(r)
         tokens = m.get("tokens") or {}
         writer.writerow([
-            r.id, r.batch_id, r.sid, r.gid, r.tid, r.result, r.result_detail,
+            r.id, r.batch_id, r.attempt, r.sid, r.gid, r.tid, r.result, r.result_detail,
             m.get("verdict"), m.get("duration_sec"), m.get("agent_duration_sec"),
             m.get("rounds"), m.get("tool_calls"),
             tokens.get("input"), tokens.get("output"), tokens.get("total"),
@@ -246,6 +267,7 @@ def get_task_group(gid: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def create_task_group(
     name: str,
     description: Optional[str] = None,
@@ -268,23 +290,34 @@ def create_task_group(
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def update_task_group(
     gid: int,
     name: Optional[str] = None,
     description: Optional[str] = None,
     variables: Optional[dict[str, Any]] = None,
     python_version: Optional[str] = None,
+    clear_fields: Optional[list[str]] = None,
 ) -> str:
-    """更新任务组。参数为 None 表示不修改；variables 传 {} 可清空变量。"""
+    """更新任务组。参数为 None 表示不修改；variables 传 {} 可清空变量。
+
+    clear_fields 可显式清空 description/variables（工具参数无法区分
+    “未提供”和 null，因此需要单独的清除列表）。
+    """
     db = _get_db()
     try:
         fields: dict[str, Any] = {}
+        clear = set(clear_fields or [])
         if name is not None:
             fields["name"] = name
         if description is not None:
             fields["description"] = description
+        elif "description" in clear:
+            fields["description"] = None
         if variables is not None:
             fields["variables"] = variables
+        elif "variables" in clear:
+            fields["variables"] = None
         if python_version is not None:
             fields["python_version"] = python_version
         group = crud.update_task_group(db, gid, schemas.TaskGroupUpdate(**fields))
@@ -296,6 +329,7 @@ def update_task_group(
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_task_group(gid: int) -> str:
     """删除任务组（级联删除组内任务、批次与结果，并清理工作空间和运行上下文）。"""
     db = _get_db()
@@ -350,6 +384,7 @@ def get_task_detail(tid: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def render_task_prompt(tid: int) -> str:
     """用任务组变量渲染任务 prompt，返回可直接发给 Agent 的最终文本。"""
     db = _get_db()
@@ -387,6 +422,7 @@ def render_task_prompt(tid: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def create_task(
     gid: int,
     name: str,
@@ -422,13 +458,17 @@ def create_task(
             expect=expect,
             clean=clean,
         )
-        task = crud.create_task(db, gid, data)
+        try:
+            task = crud.create_task(db, gid, data)
+        except task_graph.DependencyError as exc:
+            return _dump({"error": "依赖不合法", "issues": exc.issues})
         return _dump(_task_to_dict(task))
     finally:
         db.close()
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def update_task(
     tid: int,
     name: Optional[str] = None,
@@ -441,34 +481,55 @@ def update_task(
     timeout: Optional[int] = None,
     expect: Optional[str] = None,
     clean: Optional[str] = None,
+    clear_fields: Optional[list[str]] = None,
 ) -> str:
     """更新任务。参数为 None 表示不修改；depends 传 [] 可清空依赖。
 
     prompt/conversation 是 input 字段的便捷写法，两者都传时以 input 为准。
+    clear_fields 可显式清空 description/depends/pre_script/input/timeout/
+    expect/clean（工具参数无法区分“未提供”和 null）。
     """
     db = _get_db()
     try:
         if crud.get_task(db, tid) is None:
             return _dump({"error": f"任务 {tid} 不存在"})
         fields: dict[str, Any] = {}
+        clear = set(clear_fields or [])
         if name is not None:
             fields["name"] = name
         if description is not None:
             fields["description"] = description
+        elif "description" in clear:
+            fields["description"] = None
         if depends is not None:
             fields["depends"] = depends
+        elif "depends" in clear:
+            fields["depends"] = None
         if pre_script is not None:
             fields["pre_script"] = pre_script
+        elif "pre_script" in clear:
+            fields["pre_script"] = None
         new_input = _build_task_input(input, prompt, conversation)
         if new_input is not None:
             fields["input"] = new_input
+        elif "input" in clear:
+            fields["input"] = None
         if timeout is not None:
             fields["timeout"] = timeout
+        elif "timeout" in clear:
+            fields["timeout"] = None
         if expect is not None:
             fields["expect"] = expect
+        elif "expect" in clear:
+            fields["expect"] = None
         if clean is not None:
             fields["clean"] = clean
-        task = crud.update_task(db, tid, schemas.TaskUpdate(**fields))
+        elif "clean" in clear:
+            fields["clean"] = None
+        try:
+            task = crud.update_task(db, tid, schemas.TaskUpdate(**fields))
+        except task_graph.DependencyError as exc:
+            return _dump({"error": "依赖不合法", "issues": exc.issues})
         if task is None:
             return _dump({"error": f"任务 {tid} 不存在"})
         return _dump(_task_to_dict(task))
@@ -477,6 +538,7 @@ def update_task(
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_task(tid: int) -> str:
     """删除任务。"""
     db = _get_db()
@@ -515,6 +577,7 @@ def get_subject(sid: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def create_subject(
     name: str,
     ipaddr: str,
@@ -535,6 +598,7 @@ def create_subject(
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def update_subject(
     sid: int,
     name: Optional[str] = None,
@@ -566,6 +630,7 @@ def update_subject(
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_subject(sid: int) -> str:
     """删除待测 agent。"""
     db = _get_db()
@@ -580,6 +645,7 @@ def delete_subject(sid: int) -> str:
 # ── 批次 ───────────────────────────────────────────────────────
 
 @mcp.tool()
+@mcp_auth.require_admin
 def create_batch(sid: int, gid: int) -> str:
     """创建测试批次。返回批次 id，可用于后续启动和查询。"""
     db = _get_db()
@@ -588,6 +654,9 @@ def create_batch(sid: int, gid: int) -> str:
             return _dump({"error": f"待测主体 {sid} 不存在"})
         if crud.get_task_group(db, gid) is None:
             return _dump({"error": f"任务组 {gid} 不存在"})
+        issues = task_graph.validate_tasks(crud.list_tasks(db, gid=gid))
+        if issues:
+            return _dump({"error": "依赖图不合法", "issues": issues})
         batch = crud.create_batch(db, sid, gid)
         return _dump(_batch_to_dict(batch))
     finally:
@@ -607,6 +676,7 @@ def list_batches(skip: int = 0, limit: int = 100) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def start_batch(batch_id: int) -> str:
     """启动批次执行（异步，立即返回）。批次将在后台线程中执行所有任务。"""
     db = _get_db()
@@ -618,6 +688,19 @@ def start_batch(batch_id: int) -> str:
             return _dump({"error": "批次已在执行中"})
         if executor.has_running_task(batch_id):
             return _dump({"error": "该批次有任务正在单独执行，请等待完成"})
+        manifest = manifest_mod.parse_manifest(batch.manifest)
+        manifest_ok = bool(
+            manifest
+            and manifest.get("manifest_version") == manifest_mod.MANIFEST_VERSION
+            and not manifest.get("error")
+        )
+        tasks = (manifest_mod.tasks_from_manifest(manifest) if manifest_ok
+                 else crud.list_tasks(db, gid=batch.gid))
+        issues = task_graph.validate_tasks(tasks)
+        if issues:
+            return _dump({"error": "依赖图不合法，无法执行", "issues": issues})
+        if not tasks:
+            return _dump({"error": "批次没有可执行的任务"})
         if not executor.start_batch_async(batch_id):
             return _dump({"error": "批次已在执行队列中"})
         return _dump({
@@ -645,8 +728,11 @@ def get_batch_status(batch_id: int) -> str:
 
 
 @mcp.tool()
-def get_batch_detail(batch_id: int) -> str:
-    """获取批次详情：主体/任务组名称、聚合指标、每任务结果摘要、正在单独执行的任务。"""
+def get_batch_detail(batch_id: int, attempt: Optional[int] = None) -> str:
+    """获取批次详情：主体/任务组名称、聚合指标、每任务结果摘要、正在单独执行的任务。
+
+    attempt 为空查看最新一轮；指定 attempt 查看该轮历史结果。
+    """
     db = _get_db()
     try:
         batch = crud.get_batch(db, batch_id)
@@ -655,8 +741,22 @@ def get_batch_detail(batch_id: int) -> str:
 
         subject = crud.get_subject(db, batch.sid)
         group = crud.get_task_group(db, batch.gid)
-        tasks = crud.list_tasks(db, gid=batch.gid)
-        results = crud.list_results(db, batch_id=batch.id)
+        manifest = manifest_mod.parse_manifest(batch.manifest)
+        manifest_ok = bool(
+            manifest
+            and manifest.get("manifest_version") == manifest_mod.MANIFEST_VERSION
+            and not manifest.get("error")
+        )
+        tasks = (manifest_mod.tasks_from_manifest(manifest) if manifest_ok
+                 else crud.list_tasks(db, gid=batch.gid))
+        effective_attempt = batch.attempt if attempt is None else attempt
+        # 显式 attempt=0 要过滤到第 0 轮；默认且批次未跑过时才取全部
+        attempt_filter = (
+            effective_attempt
+            if attempt is not None or (batch.attempt or 0) > 0
+            else None)
+        results = crud.list_results(
+            db, batch_id=batch.id, attempt=attempt_filter)
         # list_results 按 id 倒序，每 tid 取最新一条
         by_tid: dict[int, models.TaskResult] = {}
         for r in results:
@@ -671,8 +771,13 @@ def get_batch_detail(batch_id: int) -> str:
                 "tid": task.tid,
                 "name": task.name,
                 "depends": _parse_depends(task.depends),
+                "pre_script": task.pre_script,
+                "expect": task.expect,
+                "clean": task.clean,
+                "timeout": task.timeout,
                 "result": r.result if r else 0,
                 "result_detail": r.result_detail if r else None,
+                "attempt": r.attempt if r else (batch.attempt or 0),
                 "verdict": summary["verdict"],
                 "verdict_text": summary["verdict_text"],
                 "result_text": summary["verdict_text"],
@@ -681,17 +786,25 @@ def get_batch_detail(batch_id: int) -> str:
                 "create_time": r.create_time.isoformat() if r else None,
                 "result_id": r.id if r else None,
                 "metrics": summary,
+                "definition_source": "manifest" if manifest_ok else "live",
             })
 
         data = _batch_to_dict(
             batch,
             compute_batch_metrics(results, task_count=len(tasks)),
         )
+        available = sorted(set(crud.list_batch_attempts(db, batch.id)) | {batch.attempt or 0})
+        cfg = get_config()
         data.update({
             "subject_name": subject.name if subject else None,
             "group_name": group.name if group else None,
             "tasks": task_details,
             "running_task_tid": executor.running_task_tid(batch.id),
+            "viewing_attempt": effective_attempt,
+            "available_attempts": available,
+            "manifest_summary": (
+                manifest_mod.manifest_summary(manifest, cfg.security_mask_placeholder)
+                if manifest_ok else None),
         })
         return _dump(data)
     finally:
@@ -699,6 +812,7 @@ def get_batch_detail(batch_id: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def run_batch_task(batch_id: int, tid: int, force: bool = False) -> str:
     """异步执行批次内的单个任务。force=true 时忽略依赖检查（用于单独调试）。"""
     db = _get_db()
@@ -728,6 +842,7 @@ def run_batch_task(batch_id: int, tid: int, force: bool = False) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def cancel_batch(batch_id: int) -> str:
     """取消正在执行的批次。"""
     db = _get_db()
@@ -742,6 +857,7 @@ def cancel_batch(batch_id: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_batch(batch_id: int) -> str:
     """删除批次（只删除该批次自己的结果，不影响同主体/同组的其他批次）。"""
     db = _get_db()
@@ -754,23 +870,37 @@ def delete_batch(batch_id: int) -> str:
 
 
 @mcp.tool()
-def get_task_results(batch_id: int) -> str:
-    """查询批次中所有任务的执行结果。"""
+def get_task_results(batch_id: int, attempt: Optional[int] = None) -> str:
+    """查询批次中所有任务的执行结果；attempt 为空查看最新一轮。"""
     db = _get_db()
     try:
         batch = crud.get_batch(db, batch_id)
         if batch is None:
             return _dump({"error": f"批次 {batch_id} 不存在"})
-        tasks = crud.list_tasks(db, gid=batch.gid)
+        manifest = manifest_mod.parse_manifest(batch.manifest)
+        manifest_ok = bool(
+            manifest
+            and manifest.get("manifest_version") == manifest_mod.MANIFEST_VERSION
+            and not manifest.get("error")
+        )
+        tasks = (manifest_mod.tasks_from_manifest(manifest) if manifest_ok
+                 else crud.list_tasks(db, gid=batch.gid))
+        effective_attempt = batch.attempt if attempt is None else attempt
+        attempt_filter = (
+            effective_attempt
+            if attempt is not None or (batch.attempt or 0) > 0
+            else None)
         results = []
         for task in tasks:
-            r = crud.get_batch_task_result(db, batch_id, task.tid)
+            r = crud.get_batch_task_result(
+                db, batch_id, task.tid, attempt=attempt_filter)
             summary = result_summary(r) if r else None
             results.append({
                 "tid": task.tid,
                 "name": task.name,
                 "result": r.result if r else 0,
                 "result_detail": r.result_detail if r else None,
+                "attempt": r.attempt if r else (batch.attempt or 0),
                 "verdict": summary["verdict"] if summary else "PENDING",
                 "verdict_text": summary["verdict_text"] if summary else "未执行",
                 "metrics": summary,
@@ -784,15 +914,18 @@ def get_task_results(batch_id: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def submit_task_result(
     batch_id: int,
     tid: int,
     result: int,
     process: Optional[str] = None,
+    validated: bool = False,
 ) -> str:
     """智能体主动上报任务结果。result: 0=未执行, 1=成功, 2=失败。
 
-    用于智能体主导执行模式：智能体通过 MCP 拉取任务、自主执行、上报结果。
+    validated=False（默认）时 result=1 记为“未校验”，不能算质量通过；
+    只有明确声明已执行校验时才记 PASS。
     """
     db = _get_db()
     try:
@@ -807,6 +940,16 @@ def submit_task_result(
         if task.gid != batch.gid:
             return _dump({"error": f"任务 {tid} 不属于批次 {batch_id} 的任务组"})
 
+        if result == 1:
+            detail = 2 if validated else 3
+            expect_success = True if validated else None
+        elif result == 2:
+            detail = 0
+            expect_success = False if validated else None
+        else:
+            detail = None
+            expect_success = None
+
         r = crud.create_result(
             db,
             sid=batch.sid,
@@ -815,19 +958,25 @@ def submit_task_result(
             result=result,
             process=process,
             batch_id=batch_id,
-            result_detail=2 if result == 1 else (0 if result == 2 else None),
+            result_detail=detail,
+            attempt=getattr(batch, "attempt", None),
             metrics=json.dumps({
                 "metrics_version": 2,
                 "stage": "manual",
                 "agent_success": result == 1,
-                "expect_success": result == 1,
+                "expect_configured": bool(validated),
+                "expect_success": expect_success,
+                "validated": bool(validated and result == 1),
             }, ensure_ascii=False),
         )
+        executor.recompute_batch_status(db, batch_id)
         return _dump({
             "result_id": r.id,
             "batch_id": batch_id,
             "tid": tid,
             "result": result,
+            "validated": bool(validated),
+            "attempt": getattr(batch, "attempt", None),
             "message": "结果已记录",
         })
     finally:
@@ -835,13 +984,17 @@ def submit_task_result(
 
 
 @mcp.tool()
-def export_batch_csv(batch_id: int) -> str:
-    """导出批次结果为 CSV 格式文本（同一任务重跑时取最新结果）。"""
+def export_batch_csv(batch_id: int, attempt: Optional[int] = None) -> str:
+    """导出批次结果为 CSV 格式文本（同一任务重跑时取最新结果）。
+
+    attempt 为空时导出最新结果；指定 attempt 时只导出该轮。
+    """
     db = _get_db()
     try:
         if crud.get_batch(db, batch_id) is None:
             return _dump({"error": f"批次 {batch_id} 不存在"})
-        results = latest_results_by_tid(crud.list_results(db, batch_id=batch_id))
+        results = latest_results_by_tid(
+            crud.list_results(db, batch_id=batch_id, attempt=attempt))
         if not results:
             return _dump({"error": "批次无结果"})
         return _results_csv_text(results)
@@ -858,10 +1011,11 @@ def list_results(
     tid: Optional[int] = None,
     result: Optional[int] = None,
     batch_id: Optional[int] = None,
+    attempt: Optional[int] = None,
     skip: int = 0,
     limit: int = 500,
 ) -> str:
-    """查询执行结果，支持按 sid/gid/tid/result/batch_id 过滤，按 id 倒序分页。
+    """查询执行结果，支持按 sid/gid/tid/result/batch_id/attempt 过滤，按 id 倒序分页。
 
     返回 {"total": 匹配总数, "returned": 本次返回条数, "results": [...]}；
     process 默认截断到 2000 字符，完整日志用 get_result。
@@ -870,6 +1024,7 @@ def list_results(
     try:
         results = crud.list_results(
             db, sid=sid, gid=gid, tid=tid, result=result, batch_id=batch_id,
+            attempt=attempt,
         )
         total = len(results)
         skip = max(0, skip)
@@ -897,6 +1052,7 @@ def get_result(result_id: int) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_results(result_ids: list[int]) -> str:
     """批量删除结果。result_ids 为结果 id 列表。"""
     db = _get_db()
@@ -920,11 +1076,13 @@ def export_results_csv(
     sid: Optional[int] = None,
     gid: Optional[int] = None,
     batch_id: Optional[int] = None,
+    attempt: Optional[int] = None,
 ) -> str:
     """按条件导出结果为 CSV 文本（指定 batch_id 时同一任务取最新结果）。"""
     db = _get_db()
     try:
-        results = crud.list_results(db, sid=sid, gid=gid, batch_id=batch_id)
+        results = crud.list_results(
+            db, sid=sid, gid=gid, batch_id=batch_id, attempt=attempt)
         if batch_id is not None:
             results = latest_results_by_tid(results)
         if not results:
@@ -997,6 +1155,7 @@ def read_workspace_file(gid: int, path: str) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def write_workspace_file(gid: int, path: str, content: str) -> str:
     """写入工作空间文件（不存在则创建，父目录自动创建；.py/.sh 自动加可执行权限）。"""
     db = _get_db()
@@ -1019,6 +1178,7 @@ def write_workspace_file(gid: int, path: str, content: str) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def make_workspace_dir(gid: int, path: str) -> str:
     """在工作空间内创建目录（已存在时静默成功）。"""
     db = _get_db()
@@ -1036,6 +1196,7 @@ def make_workspace_dir(gid: int, path: str) -> str:
 
 
 @mcp.tool()
+@mcp_auth.require_admin
 def delete_workspace_path(gid: int, path: str) -> str:
     """删除工作空间内的文件或目录（目录递归删除，不能删除工作空间根目录）。"""
     db = _get_db()
@@ -1061,11 +1222,31 @@ def delete_workspace_path(gid: int, path: str) -> str:
 
 
 def run_mcp_server(host: str, port: int, path: str = "/mcp"):
-    """在独立线程中启动 MCP 服务。"""
+    """在独立线程中启动 MCP 服务（带 Bearer token 认证）。"""
     import uvicorn
+    from mcp.server.transport_security import TransportSecuritySettings
 
-    # FastMCP 的 streamable HTTP app 默认挂 /mcp
+    cfg = get_config()
+    mcp.settings.streamable_http_path = path or cfg.mcp_path
+    if cfg.mcp_allowed_hosts or cfg.mcp_allowed_origins:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            allowed_hosts=cfg.mcp_allowed_hosts,
+            allowed_origins=cfg.mcp_allowed_origins,
+        )
+
+    store, info = mcp_auth.load_token_store(cfg)
     app = mcp.streamable_http_app()
+    app = mcp_auth.MCPAuthMiddleware(
+        app, store, allow_unauthenticated=cfg.mcp_allow_unauthenticated)
+
+    if cfg.mcp_allow_unauthenticated:
+        print("[ebaseline][WARN] MCP 认证已关闭（mcp.allow_unauthenticated=true）")
+    elif info.get("generated"):
+        print(f"[ebaseline] MCP 访问 token 已生成: {info.get('path')}（权限 0600）")
+        print("[ebaseline] 客户端需设置 Authorization: Bearer <该文件内容>")
+    elif info.get("path"):
+        print(f"[ebaseline] MCP 使用已有 token: {info['path']}")
+
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

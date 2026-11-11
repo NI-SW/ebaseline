@@ -23,11 +23,14 @@ def list_results(
     tid: int | None = None,
     result: int | None = None,
     batch_id: int | None = None,
+    attempt: int | None = None,
     db: Session = Depends(get_db),
     _: models.User = Depends(get_current_user),
 ):
-    """查询结果，支持按 batch_id/sid/gid/tid/result 过滤。"""
-    results = crud.list_results(db, sid=sid, gid=gid, tid=tid, result=result, batch_id=batch_id)
+    """查询结果，支持按 batch_id/sid/gid/tid/result/attempt 过滤。"""
+    results = crud.list_results(
+        db, sid=sid, gid=gid, tid=tid, result=result, batch_id=batch_id,
+        attempt=attempt)
     return [
         {
             "id": r.id,
@@ -37,6 +40,7 @@ def list_results(
             "tid": r.tid,
             "result": r.result,
             "result_detail": r.result_detail,
+            "attempt": r.attempt,
             "metrics": result_summary(r),
             "process": r.process,
             "create_time": r.create_time,
@@ -50,11 +54,13 @@ def export_results(
     sid: int | None = None,
     gid: int | None = None,
     batch_id: int | None = None,
+    attempt: int | None = None,
     db: Session = Depends(get_db),
     _: models.User = Depends(get_current_user),
 ):
-    """导出结果为 CSV（可按批次过滤）。"""
-    results = crud.list_results(db, sid=sid, gid=gid, batch_id=batch_id)
+    """导出结果为 CSV（可按批次/attempt 过滤）。"""
+    results = crud.list_results(
+        db, sid=sid, gid=gid, batch_id=batch_id, attempt=attempt)
     # 批次导出按任务取最新结果：单任务重跑会产生同 tid 的多条历史记录
     if batch_id is not None:
         results = latest_results_by_tid(results)
@@ -64,7 +70,7 @@ def export_results(
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "id", "batch_id", "sid", "gid", "tid", "result", "result_detail",
+        "id", "batch_id", "attempt", "sid", "gid", "tid", "result", "result_detail",
         "verdict", "duration_sec", "agent_duration_sec", "rounds", "tool_calls",
         "tokens_input", "tokens_output", "tokens_total", "first_token_ms",
         "process", "create_time",
@@ -73,7 +79,7 @@ def export_results(
         m = result_summary(r)
         tokens = m.get("tokens") or {}
         writer.writerow([
-            r.id, r.batch_id, r.sid, r.gid, r.tid, r.result, r.result_detail,
+            r.id, r.batch_id, r.attempt, r.sid, r.gid, r.tid, r.result, r.result_detail,
             m.get("verdict"), m.get("duration_sec"), m.get("agent_duration_sec"),
             m.get("rounds"), m.get("tool_calls"),
             tokens.get("input"), tokens.get("output"), tokens.get("total"),
@@ -107,6 +113,7 @@ def get_result(
         "tid": r.tid,
         "result": r.result,
         "result_detail": r.result_detail,
+        "attempt": r.attempt,
         "metrics": result_summary(r),
         "process": r.process,
         "create_time": r.create_time.isoformat() if r.create_time else None,

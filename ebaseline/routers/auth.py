@@ -12,6 +12,7 @@ from ..auth import (
     init_admin_user,
     verify_password,
 )
+from ..config import get_config
 from ..database import get_db
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -19,7 +20,9 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 @router.post("/register", response_model=schemas.UserResponse, status_code=201)
 def register(data: schemas.RegisterRequest, db: Session = Depends(get_db)):
-    """注册新用户（默认 privilege=0）。"""
+    """注册新用户（默认 privilege=0）。可通过 auth.allow_register 关闭。"""
+    if not get_config().auth_allow_register:
+        raise HTTPException(status_code=403, detail="注册已关闭，请联系管理员创建账号")
     existing = db.query(models.User).filter(models.User.username == data.username).first()
     if existing:
         raise HTTPException(status_code=409, detail="用户名已存在")
@@ -61,5 +64,9 @@ def me(user: models.User = Depends(get_current_user)):
 
 @router.post("/init-admin", response_model=schemas.UserResponse)
 def init_admin(db: Session = Depends(get_db)):
-    """初始化 admin 用户（如果不存在）。无需登录，仅首次使用。"""
+    """初始化 admin 用户（仅在系统还没有任何用户且配置放行时可用）。"""
+    if not get_config().auth_allow_init_admin:
+        raise HTTPException(status_code=403, detail="公开初始化接口已关闭")
+    if db.query(models.User).count() > 0:
+        raise HTTPException(status_code=403, detail="系统已有用户，禁止通过公开接口初始化")
     return init_admin_user(db)
